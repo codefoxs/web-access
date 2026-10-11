@@ -3,17 +3,39 @@
 ## 基础信息
 
 - 地址：`http://localhost:3456`
-- 启动：`node ~/.claude/skills/web-access/scripts/cdp-proxy.mjs &`
-- 启动后持续运行，不建议主动停止（重启需 Chrome 重新授权）
-- 强制停止：`pkill -f cdp-proxy.mjs`
+- 检查、复用或后台启动：`node ~/.claude/skills/web-access/scripts/check-deps.mjs`
+- 服务持续运行，没有时长或空闲退出计时器；检查超时不会停止服务
+- 集中维护：`node <skill路径>/scripts/proxy-maintenance.mjs status|restart|stop`（Windows / macOS / Linux 相同）
 
 ## API 端点
 
 ### GET /health
-健康检查，返回连接状态。
+健康检查，不建立浏览器连接。`status: "ok"` 表示服务响应正常；只有 `connected === true` 才表示已有连接可复用。已有服务断线时，前置检查通过 `/targets` 让原服务重新连接，不启动第二个进程。浏览器重启或撤销权限后，重连可能再次需要浏览器授权。
 ```bash
 curl -s http://localhost:3456/health
 ```
+
+| 字段 | 含义 |
+|------|------|
+| `instanceId` / `pid` / `startedAt` | 当前服务实例身份、进程号和启动时间 |
+| `browser.source` | 浏览器选择来源（偏好或临时覆盖），不是端口进程身份的自动验证 |
+| `runningRevision` | 启动时加载的 Proxy 与连接模块源码指纹，文件修改不会自动重启服务 |
+| `connectionState` | `disconnected` → `discovering` → `connecting` → `connected`；失败退回 `disconnected` |
+| `connectionAttempts` | 当前实例累计的连接尝试次数；并发等待不会增加次数 |
+| `pendingCommands` | 未完成的 CDP 命令数 |
+| `activeRequests` | 执行中的浏览器操作请求数，不含健康检查和维护请求 |
+| `managedTabs` | 当前服务管理的 Agent 标签页数 |
+| `maintenance` | 正在停止；前置检查不得把它当作可用或启动第二个实例 |
+
+### POST /shutdown
+
+维护 CLI 专用。JSON body 为 `{ "instanceId": "从健康检查读取的身份" }`。只接受不带 `Origin` 的本机 POST；实例不一致或仍有请求、命令、标签页、发现/握手时返回 `409`。接受后返回 `202`，进入维护状态，普通操作返回 `503`，退出只执行一次。健康检查仍可用于观察退出，CLI 不会因为实例被替换而停止新实例。
+
+维护 CLI 的退出码：`0` 表示状态检查/停止完成或重启后连接确认就绪；`2` 表示忙碌、身份冲突、旧服务缺少维护接口或参数错误；`3` 表示新服务已启动但尚未连接（`waitingAuthorization`，也可能是调试设置或浏览器不可用）；其他错误为 `1`。旧服务的一次性迁移需要先确认没有任务使用它，不自动强停。普通任务不要在结束时停止服务，代码变更由集中维护升级一次。
+
+连接模块 `scripts/cdp-connection.mjs` 唯一拥有 socket、连接尝试和命令响应。`connect()` 从浏览器发现开始共享同一个 Promise；`send()` 只在已有连接发送，不隐式连接；`close()` 立即拒绝该连接的等待者。每个 socket 的事件只作用于它自己的连接上下文，失败会清空该连接的命令等待，后续请求可重试。模块同时支持原生 WebSocket（EventTarget）和 `ws`（EventEmitter）。服务端 HTTP 和标签页职责保留在 Proxy，浏览器选择保留在 discovery 模块。
+
+`config.env` 中可选的 `WEB_ACCESS_CDP_PORT` 明确绑定 `WEB_ACCESS_BROWSER`，用于端口文件受系统权限限制或固定端口的连接方式。留空使用文件发现，非空必须是十进制 `1..65535` 且浏览器受当前平台支持。显式映射须先核对浏览器归属；发现只检测 TCP，不建立授权握手。不同浏览器覆盖不借用此端口，离线也不回退。端口文件的 `EPERM/EACCES` 会作为权限事实报告，不能据此断言未开启调试。
 
 ### GET /targets
 列出所有已打开的页面 tab。返回数组，每项含 `targetId`、`title`、`url`。

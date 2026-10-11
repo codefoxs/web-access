@@ -13,11 +13,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { selectBrowser, knownBrowsers, findFallbackPort } from './browser-discovery.mjs';
+import { selectBrowser, knownBrowsers, findFallbackPort, getConfiguredBrowserId } from './browser-discovery.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROXY_SCRIPT = path.join(ROOT, 'scripts', 'cdp-proxy.mjs');
 const PROXY_PORT = Number(process.env.CDP_PROXY_PORT || 3456);
+const HEALTH_URL = `http://127.0.0.1:${PROXY_PORT}/health`;
 const CONFIG_PATH = path.join(ROOT, 'config.env');
 const CONFIG_TEMPLATE = path.join(ROOT, 'templates', 'config.env.template');
 
@@ -57,7 +58,7 @@ function checkNode() {
 
 function httpGetJson(url, timeoutMs = 3000) {
   return fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
-    .then(async (res) => { try { return JSON.parse(await res.text()); } catch { return null; } })
+    .then(async (res) => { if (!res.ok) return null; try { return JSON.parse(await res.text()); } catch { return null; } })
     .catch(() => null);
 }
 
@@ -75,36 +76,59 @@ function startProxyDetached(browserOverride) {
   fs.closeSync(logFd);
 }
 
-async function ensureProxy(expectedBrowserId, browserOverride) {
-  const healthUrl = `http://127.0.0.1:${PROXY_PORT}/health`;
+function matchesBrowser(health, expectedBrowserId) {
+  const runningId = health.browser?.id;
+  const runningLabel = health.browser?.label || runningId || 'unknown';
+  if (expectedBrowserId && (!runningId || runningId === 'unknown') && health.connected === true) {
+    console.log(`proxy: 无法确认当前连接的浏览器是否为 ${expectedBrowserId}，保留已有实例`);
+    return false;
+  }
+  if (expectedBrowserId && runningId && runningId !== 'unknown' && runningId !== expectedBrowserId) {
+    console.log(`proxy: 浏览器不一致 — 当前实例使用 ${runningLabel}，但本次需要 ${expectedBrowserId}`);
+    console.log('  如需切换浏览器，请等共享任务完成，运行 node scripts/proxy-maintenance.mjs stop 后再指定 --browser');
+    return false;
+  }
+  return true;
+}
+
+async function ensureProxy(expectedBrowserId, browserOverride, health) {
   const targetsUrl = `http://127.0.0.1:${PROXY_PORT}/targets`;
 
-  // 复用：proxy 已运行 + 已连接浏览器 → 校验 expected vs actual
-  const health = await httpGetJson(healthUrl);
-  if (health?.status === 'ok' && health.connected) {
-    const runningId = health.browser?.id;
-    const runningLabel = health.browser?.label || runningId || 'unknown';
-    if (expectedBrowserId && runningId && runningId !== 'unknown' && runningId !== expectedBrowserId) {
-      console.log(`proxy: 浏览器不一致 — 当前已连着 ${runningLabel}，但本次需要 ${expectedBrowserId}`);
-      console.log('  请在终端运行 pkill -f cdp-proxy.mjs 重置后再试');
+  // 已有服务由自身维护连接；断线不意味着进程退出。
+  if (health?.status === 'ok') {
+    if (health.maintenance) {
+      console.log('proxy: 共享服务正在维护，请等待维护完成后重试；保留已有实例');
       return false;
     }
-    console.log(`proxy: ready (${runningLabel})`);
-    return true;
+    if (!matchesBrowser(health, expectedBrowserId)) return false;
+    if (health.connected === true) {
+      const label = health.browser?.label || health.browser?.id || 'unknown';
+      console.log(`proxy: ready (${label}) [复用已有实例]`);
+      return true;
+    }
+    console.log('proxy: reconnecting... [复用已有实例]');
+  } else {
+    console.log('proxy: connecting...');
+    startProxyDetached(browserOverride);
+    await new Promise((r) => setTimeout(r, 2000));
   }
-
-  console.log('proxy: connecting...');
-  startProxyDetached(browserOverride);
-
-  await new Promise((r) => setTimeout(r, 2000));
 
   for (let i = 1; i <= 15; i++) {
     const result = await httpGetJson(targetsUrl, 8000);
     if (Array.isArray(result)) {
-      const newHealth = await httpGetJson(healthUrl);
-      const label = newHealth?.browser?.label || 'unknown';
-      console.log(`proxy: ready (${label})`);
-      return true;
+      const newHealth = await httpGetJson(HEALTH_URL);
+      if (newHealth?.status === 'ok') {
+        if (newHealth.maintenance) {
+          console.log('proxy: 共享服务正在维护，请等待维护完成后重试；保留已有实例');
+          return false;
+        }
+        if (!matchesBrowser(newHealth, expectedBrowserId)) return false;
+        if (newHealth.connected === true) {
+          const label = newHealth.browser?.label || newHealth.browser?.id || 'unknown';
+          console.log(`proxy: ready (${label})`);
+          return true;
+        }
+      }
     }
     if (i === 1) {
       console.log('⚠️  浏览器可能有授权弹窗，请点击「允许」后等待连接...');
@@ -134,6 +158,10 @@ async function resolveAndReport(override) {
   const result = await selectBrowser(override);
 
   switch (result.kind) {
+    case 'config-error': {
+      console.log(`browser: 配置错误 — ${result.message}`);
+      return { proceed: false, exitCode: 1 };
+    }
     case 'ok': {
       const sourceTag = result.source === 'override' ? '[--browser 指定]' : '[config.env 偏好]';
       console.log(`browser: ok (${result.browser.label}, port ${result.browser.port}) ${sourceTag}`);
@@ -152,6 +180,13 @@ async function resolveAndReport(override) {
       const expected = result.override || result.configured;
       const expectedLabel = knownBrowsers().find(b => b.id === expected)?.label || expected;
       const sourceDesc = result.source === 'override' ? '本次指定' : '默认偏好';
+      const denied = result.inaccessible?.find(b => b.id === expected);
+      if (denied) {
+        console.log(`browser: 文件访问受限 — 无法读取 ${expectedLabel} 的调试端口文件（${denied.code}）`);
+        console.log(`  路径：${denied.devToolsPath}`);
+        console.log('  请允许当前工具读取该文件，或在 config.env 为 WEB_ACCESS_BROWSER 设置已核对的 WEB_ACCESS_CDP_PORT；不会猜测端口或切换浏览器');
+        return { proceed: false, exitCode: 1 };
+      }
       console.log(`browser: error — ${sourceDesc}的浏览器是 "${expected}" (${expectedLabel})，但没连上`);
       console.log(`  Agent 处理顺序：`);
       console.log(`    1. 先用系统命令打开 ${expectedLabel}（按你所在平台自行选择，如 macOS 的 open -a），再重新运行 node check-deps.mjs`);
@@ -164,6 +199,11 @@ async function resolveAndReport(override) {
     }
 
     case 'empty': {
+      if (result.inaccessible?.length) {
+        console.log(`browser: 文件访问受限 — ${result.inaccessible.map(b => `${b.label} (${b.code})`).join('、')}`);
+        console.log('  请允许当前工具读取调试端口文件，或在 config.env 明确配置 WEB_ACCESS_BROWSER 与已核对的 WEB_ACCESS_CDP_PORT');
+        return { proceed: false, exitCode: 1 };
+      }
       // 末路兜底：尝试常见固定端口（用户手动 --remote-debugging-port=9222 启动的场景）
       const fallbackPort = await findFallbackPort();
       if (fallbackPort) {
@@ -185,10 +225,16 @@ async function main() {
   ensureConfigExists();
   checkNode();
 
-  const { proceed, exitCode, browserId } = await resolveAndReport(opts.browser);
-  if (!proceed) process.exit(exitCode);
+  // 先复用服务，避免调试端口文件缺失或未设置偏好阻断现有连接。
+  const health = await httpGetJson(HEALTH_URL);
+  let browserId = opts.browser || getConfiguredBrowserId();
+  if (health?.status !== 'ok') {
+    const resolved = await resolveAndReport(opts.browser);
+    if (!resolved.proceed) process.exit(resolved.exitCode);
+    browserId = resolved.browserId;
+  }
 
-  const proxyOk = await ensureProxy(browserId, opts.browser);
+  const proxyOk = await ensureProxy(browserId, opts.browser, health);
   if (!proxyOk) process.exit(1);
 
   // 列出已有站点经验

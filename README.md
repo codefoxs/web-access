@@ -134,6 +134,8 @@ skill 长期偏好保存在 `${CLAUDE_SKILL_DIR}/config.env`（首次运行自�
 WEB_ACCESS_BROWSER=edge
 ```
 
+如果系统拒绝读取 `DevToolsActivePort`，或使用固定调试端口，可在同一配置中设置可选的 `WEB_ACCESS_CDP_PORT`。它必须与 `WEB_ACCESS_BROWSER` 配对，填入已核对属于该浏览器的端口；留空使用自动发现。TCP 可达只表示端口在监听，浏览器归属由这份明确配置提供。指定其他浏览器时不会借用此端口，端口失效也不自动降级。
+
 合法值：`chrome` / `edge`
 
 **临时用别的浏览器**（不修改 config.env）：
@@ -145,7 +147,9 @@ node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs" --browser chrome
 **切换浏览器**（proxy 已连接旧的）：
 
 ```bash
-pkill -f cdp-proxy.mjs && node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
+node "${CLAUDE_SKILL_DIR}/scripts/proxy-maintenance.mjs" stop
+# 确认停止成功后，再启动指定浏览器
+node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs" --browser chrome
 ```
 
 环境检查（Agent 运行时会自动完成前置检查，无需手动执行）：
@@ -156,13 +160,19 @@ node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 # 手动运行请替换为实际路径，如 ~/.claude/skills/web-access
 ```
 
+前置检查优先复用 `/health` 确认仍已连接的 Proxy；服务还在但浏览器连接断开时，由原服务重新连接。只有服务不可用时才检查浏览器并后台启动。Proxy 没有运行时长或空闲退出计时器，检查超时也不会停止它。浏览器退出、重启或撤销调试权限后，重新连接仍可能需要浏览器授权。
+
+多个 Agent 共用一条 CDP 连接；发现和握手期间的并发请求共用同一次连接尝试。旧连接的迟到事件无法清理新连接或结算新连接的命令。服务端口原子绑定保证同时启动的进程只有一个连接浏览器。
+
+集中维护使用 `node "${CLAUDE_SKILL_DIR}/scripts/proxy-maintenance.mjs" status|restart|stop`，Windows、macOS、Linux 均使用同一脚本，无需系统进程查杀命令。维护以 `/health` 的 `instanceId` 识别目标服务，忙碌时拒绝停止；`restart` 保留原浏览器选择。普通任务直接复用，不自行重启。维护命令输出状态 JSON，`waitingAuthorization` 表示服务已启动但浏览器连接还未确认，不是成功就绪。详见 [API 参考](references/cdp-api.md)。
+
 ## CDP Proxy API
 
 Proxy 通过 WebSocket 直连浏览器（兼容 `chrome://inspect` / `edge://inspect` 方式，无需命令行参数启动），提供 HTTP API：
 
 ```bash
-# 启动（Agent 会自动管理 Proxy 生命周期，无需手动启动）
-node "${CLAUDE_SKILL_DIR}/scripts/cdp-proxy.mjs" &
+# 检查并复用；没有服务时才后台启动
+node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 
 # 页面操作
 curl -s -X POST --data-raw 'https://example.com' http://localhost:3456/new  # 新建 tab（v2.5.3 起 URL 走 POST body）
@@ -177,7 +187,7 @@ curl -s "http://localhost:3456/close?target=ID"                             # �
 curl -s "http://localhost:3456/health"                                      # 查看状态（含 managedTabs 数量）
 ```
 
-Proxy 会自动追踪通过 `/new` 创建的 tab，闲置 15 分钟后自动关闭，防止 Agent 异常退出时留下孤儿 tab。可通过环境变量 `CDP_TAB_IDLE_TIMEOUT`（单位毫秒）调整超时时间。
+Proxy 会自动追踪通过 `/new` 创建的 tab，闲置 15 分钟后自动关闭，防止 Agent 异常退出时留下孤儿 tab。此清理只关闭标签页，不会关闭 Proxy 服务或断开浏览器连接。可通过环境变量 `CDP_TAB_IDLE_TIMEOUT`（单位毫秒）调整标签页超时时间。
 
 ## ⚠️ 使用前提醒
 

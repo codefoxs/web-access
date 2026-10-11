@@ -73,58 +73,92 @@ function readConfig() {
     if (i === -1) continue;
     const k = t.slice(0, i).trim();
     const v = t.slice(i + 1).trim();
-    if (k && v) cfg[k] = v;
+    if (k) cfg[k] = v;
   }
   return cfg;
 }
 
-// 返回所有开了 toggle 且端口活的浏览器
-async function detectAll() {
-  const result = [];
-  for (const browser of knownBrowsers()) {
+// 读取偏好无需探测浏览器；已有 Proxy 的连接状态由 /health 说明。
+export function getConfiguredBrowserId() {
+  return readConfig().WEB_ACCESS_BROWSER || null;
+}
+
+// 显式端口只绑定已配置的浏览器，不能被另一个浏览器的 override 借用。
+async function detectAll(browsers, configuredEndpoint) {
+  const detected = [];
+  const inaccessible = [];
+  for (const browser of browsers) {
+    if (configuredEndpoint?.id === browser.id) {
+      if (await checkPort(configuredEndpoint.port)) {
+        detected.push({ ...browser, port: configuredEndpoint.port, wsPath: null, endpointSource: 'config-port' });
+      }
+      continue;
+    }
     let content;
     try { content = fs.readFileSync(browser.devToolsPath, 'utf8'); }
-    catch { continue; }
+    catch (error) {
+      if (error.code === 'EPERM' || error.code === 'EACCES') {
+        inaccessible.push({ ...browser, code: error.code });
+      }
+      continue;
+    }
     const lines = content.trim().split(/\r?\n/).filter(Boolean);
     const port = parseInt(lines[0], 10);
     if (!(port > 0 && port < 65536)) continue;
     if (!(await checkPort(port))) continue;
-    result.push({ ...browser, port, wsPath: lines[1] || null });
+    detected.push({ ...browser, port, wsPath: lines[1] || null });
   }
-  return result;
+  return { detected, inaccessible };
 }
 
 // 决策入口
 // 参数：override — 调用方解析自命令行 --browser 的值（null 表示未传）
-// 返回 { kind, browser?, source?, detected, configured, override? }
-//   kind ∈ 'ok' | 'ambiguous' | 'mismatch' | 'empty'
+// 返回 { kind, browser?, source?, detected, configured, override?, inaccessible, message? }
+//   kind ∈ 'ok' | 'ambiguous' | 'mismatch' | 'empty' | 'config-error'
 //   source ∈ 'override' | 'preference' | undefined
 //   ambiguous = 没设偏好 + 至少一个浏览器开了 toggle，需问用户
 //   mismatch  = override/配偏好设了但未检测到对应 toggle，硬错
 //   empty     = 0 浏览器开 toggle 且未设偏好/override
 export async function selectBrowser(override = null) {
-  const detected = await detectAll();
-  const configured = readConfig().WEB_ACCESS_BROWSER || null;
+  const config = readConfig();
+  const configured = config.WEB_ACCESS_BROWSER || null;
+  const browsers = knownBrowsers();
+  let configuredEndpoint = null;
+  if (config.WEB_ACCESS_CDP_PORT) {
+    const rawPort = config.WEB_ACCESS_CDP_PORT;
+    const port = Number(rawPort);
+    let message;
+    if (!configured) message = 'WEB_ACCESS_CDP_PORT 必须与 WEB_ACCESS_BROWSER 一起配置';
+    else if (!browsers.some(browser => browser.id === configured)) {
+      message = `WEB_ACCESS_CDP_PORT 绑定的浏览器 "${configured}" 不在当前平台的支持列表中`;
+    } else if (!/^\d+$/.test(rawPort) || port < 1 || port > 65535) {
+      message = 'WEB_ACCESS_CDP_PORT 必须是 1 到 65535 的十进制整数';
+    }
+    if (message) return { kind: 'config-error', message, detected: [], configured, inaccessible: [] };
+    configuredEndpoint = { id: configured, port };
+  }
+  const { detected, inaccessible } = await detectAll(browsers, configuredEndpoint);
+  const facts = { detected, configured, inaccessible };
 
   // 1. 命令行 override（最高优先，单次有效）
   if (override) {
     const match = detected.find(b => b.id === override);
-    if (match) return { kind: 'ok', browser: match, source: 'override', detected, configured, override };
-    return { kind: 'mismatch', source: 'override', detected, configured, override };
+    if (match) return { kind: 'ok', browser: match, source: 'override', ...facts, override };
+    return { kind: 'mismatch', source: 'override', ...facts, override };
   }
 
   // 2. config.env preference（持久）
   if (configured) {
     const match = detected.find(b => b.id === configured);
-    if (match) return { kind: 'ok', browser: match, source: 'preference', detected, configured };
-    return { kind: 'mismatch', source: 'preference', detected, configured };
+    if (match) return { kind: 'ok', browser: match, source: 'preference', ...facts };
+    return { kind: 'mismatch', source: 'preference', ...facts };
   }
 
   // 3. 无偏好 —— 一律询问用户（哪怕 detected 只有一个）
   if (detected.length === 0) {
-    return { kind: 'empty', detected, configured };
+    return { kind: 'empty', ...facts };
   }
-  return { kind: 'ambiguous', detected, configured };
+  return { kind: 'ambiguous', ...facts };
 }
 
 // 兜底：扫描常用固定端口
