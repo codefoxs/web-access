@@ -29,6 +29,16 @@ AI Agent 原本的联网能力（WebSearch、WebFetch）缺少调度策略和浏
 
 > 推荐必读：[Web Access：一个 Skill，拉满 Agent 联网和浏览器能力](https://mp.weixin.qq.com/s/rps5YVB6TchT9npAaIWKCw) ，完整介绍了 Web-Access Skill 的开发细节与 Agent Skill 设计哲学，帮助你也能写出类似通用、高上限的 Skill
 
+
+> [!IMPORTANT]
+> **从旧版本升级到 v2.6 之前，请把下面这段话发给你的 Agent**（浏览器偏好和站点经验从 v2.6 起改放在 `~/.web-access/`，`npx skills update` 会先删除旧目录，不先搬就会丢）：
+>
+> ```text
+> 我要把 web-access 升级到 v2.6。升级前请先迁移我的数据：找到当前 web-access skill 的安装目录，把其中的 config.env 复制到 ~/.web-access/config.env，把 references/site-patterns/ 整个文件夹（含子文件夹）复制到 ~/.web-access/site-patterns/（Windows 上 ~ 指 %USERPROFILE%），已存在的文件不要覆盖；确认复制成功后再按 https://github.com/eze-is/web-access 的说明升级，升级后运行一次 check-deps.mjs，确认浏览器配置和站点经验都还在。
+> ```
+>
+> 用 git 或 Claude Code 插件安装的，升级后也会自动迁移；照着这段话做一遍同样安全（只复制、不覆盖）。详见 [references/migration-2.6.md](references/migration-2.6.md)。
+
 ---
 
 ## v2.6.0 能力
