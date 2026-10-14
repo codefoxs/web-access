@@ -112,7 +112,14 @@ curl -s -X POST "http://localhost:3456/clickAt?target=ID" -d 'button.upload'
 ```
 
 ### GET /clickXY?target=ID&x=120&y=90
-按页面视口坐标发送真实鼠标事件（移动、按下、松开），不激活标签页。坐标命中跨进程 iframe 时，换算成 iframe 内的坐标并发给该 iframe，只路由命中的那一层。`x`、`y` 必须是有限的非负数，否则返回 `400`。返回 `{ clicked, x, y }`，命中 iframe 时另含 `frameId` 与 `crossProcess`。坐标可用 `/eval` 取元素的 `getBoundingClientRect()` 得到；iframe 内的元素要加上 iframe 在页面中的位置。
+按页面视口坐标发送真实鼠标事件（移动、按下、松开），不激活标签页（在 headless 下验证；有界面浏览器上未实测）。坐标落在 iframe 的内容区时逐层进入，最多 5 层：
+- 跨进程 iframe：换算成该 iframe 视口内的坐标后发给它（扣除 iframe 的边框与内边距，按 transform / zoom 的缩放比例换算）
+- 同进程 iframe：照常由页面派发
+- 坐标落在 iframe 的边框或内边距上：点的是 iframe 元素本身，不进入
+
+`x`、`y` 必须是有限的非负数；坐标不在页面视口内时返回 `400`，不发出事件。返回 `{ clicked, x, y }`，进入了 iframe 时另含最内层的 `frameId`、`crossProcess` 与进入层数 `depth`。`clicked` 只表示鼠标事件已经发出，是否点中目标要再用 `/eval` 核对页面状态。
+
+坐标取法：页面上的元素用 `/eval` 取 `getBoundingClientRect()` 的中心；iframe 里的元素，用 `/eval?frame=` 取它在 iframe 视口中的坐标，再加上 iframe 内容区在页面视口中的位置（iframe 元素的 `getBoundingClientRect()` 加 `clientLeft` / `clientTop` 再加内边距；iframe 被缩放时把 iframe 内坐标乘以缩放比例）。
 ```bash
 curl -s "http://localhost:3456/clickXY?target=ID&x=120&y=90"
 ```

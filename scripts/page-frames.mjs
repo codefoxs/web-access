@@ -8,7 +8,8 @@
 //   - Page.createIsolatedWorld 用同一个名字重复调用返回同一个执行上下文，不会累积
 //   - 隔离环境有自己的一套 DOM 原型：页面改写 Document.prototype.querySelectorAll / elementFromPoint 不影响它
 // 列举与命中测试都在隔离环境里执行，不受页面脚本改写 DOM API 的影响。
-// 范围：只覆盖页面主文档里直接的 <iframe> / <frame>，不递归嵌套的 iframe。
+//   - DOM.getBoxModel 的内容框是当前 session 根视口坐标，已含边框、内边距、transform、zoom 与滚动；同进程子 frame 里的元素也相对根视口
+// 范围：列举只覆盖页面主文档里直接的 <iframe> / <frame>（不含嵌套与 shadow root 内的）；点击按坐标逐层进入，最多 MAX_NESTING 层。
 
 import { randomUUID } from 'node:crypto';
 
@@ -17,6 +18,7 @@ export class FrameError extends Error {}
 
 const FRAME_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const WORLD_NAME = 'web-access';
+const MAX_NESTING = 5; // 点击最多逐层进入 5 层 iframe
 
 export function createPageFrames({ send, ensureSession }) {
   // CDP 错误一律抛出，带上方法名
@@ -109,37 +111,78 @@ export function createPageFrames({ send, ensureSession }) {
     return { sessionId, contextId: world.executionContextId, frame };
   }
 
-  // 视口坐标 → 实际接收鼠标事件的 session 与坐标：{ sessionId, x, y, frameId?, crossProcess? }
-  // 只沿实际命中的那一层 iframe 路由；命中空白或普通元素时照常发给页面。
+  // 视口坐标 → 实际接收鼠标事件的 session 与坐标：{ sessionId, x, y, frameId?, crossProcess?, depth? }
+  // 逐层命中测试：命中 iframe 的内容区时进入该 frame 继续，直到命中普通元素或达到 MAX_NESTING 层。
+  //   - 跨进程 iframe：换到它的子 session，坐标换算到 iframe 视口内（扣除边框与内边距，按缩放比例换算）
+  //   - 同进程 iframe：鼠标事件仍发给当前 session（坐标不变），只把命中测试的坐标换算到该 frame 内
+  //   - 落在 iframe 的边框或内边距上：点的是 iframe 元素本身，留在当前 frame
+  // 坐标不在页面视口内时抛 FrameError（不发出鼠标事件）。
   async function routePoint(targetId, x, y) {
-    const sessionId = await ensureSession(targetId);
-    const contextId = await isolatedWorld(sessionId, (await frameTree(sessionId)).frame.id);
-    return withObjectGroup(sessionId, 'web-access-click', async group => {
-      const hit = await call('Runtime.evaluate', {
-        expression: `document.elementFromPoint(${x}, ${y})`, objectGroup: group, contextId,
-      }, sessionId);
-      const objectId = hit.result?.objectId;
-      if (!objectId) return { sessionId, x, y };
-      const { node } = await call('DOM.describeNode', { objectId }, sessionId);
-      if (!node.frameId) return { sessionId, x, y };
-      if (!(await iframeTargets()).has(node.frameId)) {
+    const pageSession = await ensureSession(targetId);
+    let frameId = (await frameTree(pageSession)).frame.id;
+    let sessionId = pageSession;
+    let contextId = await isolatedWorld(sessionId, frameId);
+    let rootX = x;   // 当前 session 根视口坐标：鼠标事件用
+    let rootY = y;
+    let frameX = x;  // 当前 frame 视口坐标：命中测试用
+    let frameY = y;
+    let entered = null;
+    let paint = false;
+    let oopifs = null;
+    const scopes = new Map(); // sessionId → 对象组名：每个 session 上的临时对象分别释放
+    const groupFor = sid => {
+      if (!scopes.has(sid)) scopes.set(sid, `web-access-click-${randomUUID()}`);
+      return scopes.get(sid);
+    };
+    try {
+      for (let depth = 0; depth <= MAX_NESTING; depth++) {
+        const hit = await call('Runtime.evaluate', {
+          expression: `document.elementFromPoint(${frameX}, ${frameY})`, objectGroup: groupFor(sessionId), contextId,
+        }, sessionId);
+        const objectId = hit.result?.objectId;
+        if (!objectId) {
+          if (depth === 0) throw new FrameError(`坐标 (${x}, ${y}) 不在页面视口内，没有发出点击`);
+          break;
+        }
+        const { node } = await call('DOM.describeNode', { objectId }, sessionId);
+        if (!node.frameId || depth === MAX_NESTING) break;
+        // 内容框四角（当前 session 根视口坐标，已含 transform / zoom 与页面滚动）
+        const { model } = await call('DOM.getBoxModel', { objectId }, sessionId);
+        const [left, top, right, , , bottom] = model.content;
+        if (rootX < left || rootX >= right || rootY < top || rootY >= bottom) break;
+        oopifs ??= await iframeTargets();
+        const crossProcess = oopifs.has(node.frameId);
+        const childSession = crossProcess ? await ensureSession(node.frameId) : sessionId;
+        const childContext = await isolatedWorld(childSession, node.frameId);
+        const viewport = await call('Runtime.evaluate', {
+          expression: '[innerWidth, innerHeight]', returnByValue: true, contextId: childContext,
+        }, childSession);
+        const [width, height] = viewport.result?.value || [];
+        if (!(width > 0 && height > 0)) throw new Error('iframe 视口尺寸不可用');
+        frameX = (rootX - left) / ((right - left) / width);
+        frameY = (rootY - top) / ((bottom - top) / height);
+        if (crossProcess) {
+          sessionId = childSession;
+          rootX = frameX;
+          rootY = frameY;
+          paint = false;
+        } else {
+          paint = true;
+        }
+        frameId = node.frameId;
+        contextId = childContext;
+        entered = { frameId, crossProcess, depth: depth + 1 };
+      }
+      if (paint) {
         // 后台标签页中同进程 iframe 可能还没有可用的命中测试数据：截一张最低质量的图触发绘制，不激活页面
         await call('Page.captureScreenshot', { format: 'jpeg', quality: 1, captureBeyondViewport: false }, sessionId);
-        return { sessionId, x, y, frameId: node.frameId, crossProcess: false };
       }
-      // 换算到 iframe 内容区的坐标（扣除 iframe 在视口中的位置与边框）
-      const offset = await call('Runtime.callFunctionOn', {
-        objectId,
-        functionDeclaration: 'function () { const r = this.getBoundingClientRect(); return { x: r.x + this.clientLeft, y: r.y + this.clientTop }; }',
-        returnByValue: true,
-      }, sessionId);
-      const origin = offset.result?.value;
-      if (!origin) throw new Error('iframe 坐标不可用');
-      return {
-        sessionId: await ensureSession(node.frameId),
-        x: x - origin.x, y: y - origin.y, frameId: node.frameId, crossProcess: true,
-      };
-    });
+      return { sessionId, x: rootX, y: rootY, ...(entered || {}) };
+    } finally {
+      for (const [sid, group] of scopes) {
+        await send('Runtime.releaseObjectGroup', { objectGroup: group }, sid).catch(() => {});
+      }
+    }
   }
 
   return { listFrames, frameContext, routePoint };

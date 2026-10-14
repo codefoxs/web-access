@@ -436,7 +436,8 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // GET /clickXY?target=xxx&x=120&y=90 - 按视口坐标真实鼠标点击；命中跨进程 iframe 时换算坐标并发给其子 session，不激活标签页
+    // GET /clickXY?target=xxx&x=120&y=90 - 按视口坐标真实鼠标点击；逐层进入命中的 iframe（跨进程的换算坐标后发给其子 session），不激活标签页
+    // clicked 只表示鼠标事件已发出；坐标不在视口内时 400，不发事件
     else if (pathname === '/clickXY') {
       const x = Number(q.x);
       const y = Number(q.y);
@@ -457,7 +458,7 @@ const server = http.createServer(async (req, res) => {
       }
       res.end(JSON.stringify({
         clicked: true, x, y,
-        ...(route.frameId ? { frameId: route.frameId, crossProcess: route.crossProcess } : {}),
+        ...(route.frameId ? { frameId: route.frameId, crossProcess: route.crossProcess, depth: route.depth } : {}),
       }));
     }
 

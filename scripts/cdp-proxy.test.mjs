@@ -94,15 +94,23 @@ class FakeWebSocket extends EventTarget {
         return null;
       case 'Runtime.evaluate':
         if (params.expression.includes('querySelectorAll')) return { result: { objectId: 'node-list' } };
-        if (params.expression.includes('elementFromPoint')) return { result: { objectId: 'el-oopif' } };
+        if (params.expression.includes('elementFromPoint')) {
+          // 页面上命中跨进程 iframe，视口外（测试用 x=5000）返回 null；子 frame 里命中普通按钮
+          if (params.expression.includes('elementFromPoint(5000')) return { result: { type: 'object', subtype: 'null' } };
+          return { result: { objectId: message.sessionId === 'fake-session' ? 'el-oopif' : 'el-button' } };
+        }
+        if (params.expression.includes('innerWidth')) return { result: { value: [300, 250] } };
         if (params.contextId) return { result: { value: 'frame:' + message.sessionId } };
         return null;
       case 'Runtime.getProperties':
         return { result: [{ name: '0', value: { objectId: 'el-local' } }, { name: '1', value: { objectId: 'el-oopif' } }] };
       case 'DOM.describeNode':
+        if (params.objectId === 'el-button') return { node: { attributes: [] } };
         return { node: params.objectId === 'el-local'
           ? { frameId: 'local-frame', attributes: ['name', 'kid'] }
           : { frameId: 'oopif-frame', attributes: ['id', 'pay'] } };
+      case 'DOM.getBoxModel':
+        return { model: { content: [55, 65, 355, 65, 355, 315, 55, 315] } };
       case 'Page.getFrameTree':
         return { frameTree: { frame: { id: 'user-page' }, childFrames: [{ frame: { id: 'local-frame', url: 'http://localhost/same' } }] } };
       case 'Page.createIsolatedWorld':
@@ -534,8 +542,12 @@ test('/clickXY 校验参数；命中跨进程 iframe 时鼠标事件扣除偏移
     assert.match(response.body.error, /x、y/);
   }
   assert.equal(commandsOf(await f.events(), 'Input.dispatchMouseEvent').length, 0);
+  const outside = await requestJson(f.port, '/clickXY?target=user-page&x=5000&y=5000');
+  assert.equal(outside.status, 400);
+  assert.match(outside.body.error, /不在页面视口内/);
+  assert.equal(commandsOf(await f.events(), 'Input.dispatchMouseEvent').length, 0);
   const response = await requestJson(f.port, '/clickXY?target=user-page&x=115&y=95');
-  assert.deepEqual(response.body, { clicked: true, x: 115, y: 95, frameId: 'oopif-frame', crossProcess: true });
+  assert.deepEqual(response.body, { clicked: true, x: 115, y: 95, frameId: 'oopif-frame', crossProcess: true, depth: 1 });
   const mouse = commandsOf(await f.events(), 'Input.dispatchMouseEvent');
   assert.equal(mouse.length, 3);
   assert.ok(mouse.every(event => event.sessionId === 'frame-session-1' && event.x === 60 && event.y === 30), JSON.stringify(mouse));
