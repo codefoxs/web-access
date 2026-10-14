@@ -93,9 +93,9 @@ class FakeWebSocket extends EventTarget {
         if (params.targetId === 'oopif-frame') return { sessionId: 'frame-session-' + (this.frameAttaches = (this.frameAttaches || 0) + 1) };
         return null;
       case 'Runtime.evaluate':
-        if (params.contextId) return { result: { value: 'frame:' + message.sessionId } };
         if (params.expression.includes('querySelectorAll')) return { result: { objectId: 'node-list' } };
         if (params.expression.includes('elementFromPoint')) return { result: { objectId: 'el-oopif' } };
+        if (params.contextId) return { result: { value: 'frame:' + message.sessionId } };
         return null;
       case 'Runtime.getProperties':
         return { result: [{ name: '0', value: { objectId: 'el-local' } }, { name: '1', value: { objectId: 'el-oopif' } }] };
@@ -125,7 +125,7 @@ class FakeWebSocket extends EventTarget {
         this.reply(message, { result });
         record('response', { method: message.method });
         // TEST_DETACH_FRAME=1：第一次在子 session 中执行后，浏览器解除该 session（模拟 iframe 换进程）
-        if (process.env.TEST_DETACH_FRAME === '1' && message.method === 'Runtime.evaluate' && message.params.contextId && !this.dead) {
+        if (process.env.TEST_DETACH_FRAME === '1' && message.method === 'Runtime.evaluate' && message.params.contextId && message.sessionId?.startsWith('frame-session') && !this.dead) {
           this.dead = new Set([message.sessionId]);
           this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ method: 'Target.detachedFromTarget', params: { sessionId: message.sessionId, targetId: 'oopif-frame' } }) }));
         }
@@ -517,7 +517,8 @@ test('/eval?frame= 只接受本页面 iframe 的 frameId，其他目标或格式
   }
   const attached = commandsOf(await f.events(), 'Target.attachToTarget').map(event => event.targetId);
   assert.ok(attached.every(id => id === 'user-page'), attached.join(','));
-  assert.equal(commandsOf(await f.events(), 'Page.createIsolatedWorld').length, 0);
+  // 列举只在页面根 frame 的隔离环境中进行，没有进入任何 iframe
+  assert.ok(commandsOf(await f.events(), 'Page.createIsolatedWorld').every(event => event.sessionId === 'fake-session'));
   assert.equal((await requestJson(f.port, '/frames')).status, 400);
   assert.equal((await shutdown(f, health)).status, 202);
   assert.equal((await entry.exited).code, 0);

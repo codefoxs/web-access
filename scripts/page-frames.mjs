@@ -6,6 +6,8 @@
 //   - 父页面的 Page.getFrameTree 不包含跨进程 iframe，它的网址取自 Target.getTargets
 //   - 后台标签页里，经父页面 session 发出的鼠标事件命中不了跨进程 iframe；需换算坐标后发给该 iframe 的子 session
 //   - Page.createIsolatedWorld 用同一个名字重复调用返回同一个执行上下文，不会累积
+//   - 隔离环境有自己的一套 DOM 原型：页面改写 Document.prototype.querySelectorAll / elementFromPoint 不影响它
+// 列举与命中测试都在隔离环境里执行，不受页面脚本改写 DOM API 的影响。
 // 范围：只覆盖页面主文档里直接的 <iframe> / <frame>，不递归嵌套的 iframe。
 
 import { randomUUID } from 'node:crypto';
@@ -32,6 +34,18 @@ export function createPageFrames({ send, ensureSession }) {
     finally { await send('Runtime.releaseObjectGroup', { objectGroup: group }, sessionId).catch(() => {}); }
   }
 
+  // frame 的隔离环境（同名复用同一个上下文）
+  async function isolatedWorld(sessionId, frameId) {
+    const world = await call('Page.createIsolatedWorld', { frameId, worldName: WORLD_NAME }, sessionId);
+    if (!world.executionContextId) throw new Error('iframe 执行环境不可用');
+    return world.executionContextId;
+  }
+
+  // session 根 frame 的 id 与 frame 树
+  async function frameTree(sessionId) {
+    return (await call('Page.getFrameTree', {}, sessionId)).frameTree;
+  }
+
   async function iframeTargets() {
     const { targetInfos } = await call('Target.getTargets');
     return new Map(targetInfos.filter(info => info.type === 'iframe').map(info => [info.targetId, info]));
@@ -41,9 +55,11 @@ export function createPageFrames({ send, ensureSession }) {
   // frameId 为 null 表示该 iframe 尚未加载出文档
   async function listFrames(targetId) {
     const sessionId = await ensureSession(targetId);
+    const tree = await frameTree(sessionId);
+    const contextId = await isolatedWorld(sessionId, tree.frame.id);
     return withObjectGroup(sessionId, 'web-access-frames', async group => {
       const list = await call('Runtime.evaluate', {
-        expression: "document.querySelectorAll('iframe, frame')", objectGroup: group,
+        expression: "document.querySelectorAll('iframe, frame')", objectGroup: group, contextId,
       }, sessionId);
       if (list.exceptionDetails || !list.result?.objectId) throw new Error('无法读取页面中的 iframe');
       const { result: props } = await call('Runtime.getProperties', {
@@ -54,10 +70,10 @@ export function createPageFrames({ send, ensureSession }) {
         .map(prop => prop.value.objectId);
       if (!elements.length) return [];
 
-      const [oopifs, tree] = await Promise.all([iframeTargets(), call('Page.getFrameTree', {}, sessionId)]);
+      const oopifs = await iframeTargets();
       const local = new Map();
       const walk = node => { for (const child of node?.childFrames || []) { local.set(child.frame.id, child.frame); walk(child); } };
-      walk(tree.frameTree);
+      walk(tree);
 
       const frames = [];
       for (const [index, objectId] of elements.entries()) {
@@ -97,9 +113,10 @@ export function createPageFrames({ send, ensureSession }) {
   // 只沿实际命中的那一层 iframe 路由；命中空白或普通元素时照常发给页面。
   async function routePoint(targetId, x, y) {
     const sessionId = await ensureSession(targetId);
+    const contextId = await isolatedWorld(sessionId, (await frameTree(sessionId)).frame.id);
     return withObjectGroup(sessionId, 'web-access-click', async group => {
       const hit = await call('Runtime.evaluate', {
-        expression: `document.elementFromPoint(${x}, ${y})`, objectGroup: group,
+        expression: `document.elementFromPoint(${x}, ${y})`, objectGroup: group, contextId,
       }, sessionId);
       const objectId = hit.result?.objectId;
       if (!objectId) return { sessionId, x, y };

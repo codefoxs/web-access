@@ -16,8 +16,14 @@ function fakeBrowser({ hit = null, errors = {} } = {}) {
     if (errors[method]) return { error: { message: errors[method] } };
     switch (method) {
       case 'Runtime.evaluate':
-        if (params.expression.includes('querySelectorAll')) return { result: { result: { objectId: 'node-list' } } };
-        if (params.expression.includes('elementFromPoint')) return { result: { result: hit ? { objectId: hit } : { type: 'object', subtype: 'null' } } };
+        // 主环境里页面改写了 DOM API（返回空），只有隔离环境能看到真实结果
+        if (params.expression.includes('querySelectorAll')) {
+          return { result: { result: params.contextId ? { objectId: 'node-list' } : { type: 'object', subtype: 'null' } } };
+        }
+        if (params.expression.includes('elementFromPoint')) {
+          return { result: { result: hit && params.contextId ? { objectId: hit } : { type: 'object', subtype: 'null' } } };
+        }
+        if (params.expression.includes('innerWidth')) return { result: { result: { value: [300, 250] } } };
         break;
       case 'Runtime.getProperties':
         // 故意乱序，并混入非下标属性
@@ -82,7 +88,7 @@ test('listFrames 按文档顺序列出主文档 iframe：跨进程标记、当�
   assert.deepEqual(releasedGroups(calls), ['web-access-frames']);
 });
 
-test('页面没有 iframe 时返回空数组，不查询 target 与 frame 树', async () => {
+test('页面没有 iframe 时返回空数组，不查询 iframe target', async () => {
   const calls = [];
   const frames = createPageFrames({
     ensureSession: async () => 'page-session',
@@ -90,12 +96,13 @@ test('页面没有 iframe 时返回空数组，不查询 target 与 frame 树', 
       calls.push({ method, params, sessionId });
       if (method === 'Runtime.evaluate') return { result: { result: { objectId: 'node-list' } } };
       if (method === 'Runtime.getProperties') return { result: { result: [{ name: 'length', value: { value: 0 } }] } };
+      if (method === 'Page.getFrameTree') return { result: { frameTree: { frame: { id: 'page-1' } } } };
+      if (method === 'Page.createIsolatedWorld') return { result: { executionContextId: 1 } };
       return { result: {} };
     },
   });
   assert.deepEqual(await frames.listFrames('page-1'), []);
   assert.ok(!methods(calls).includes('Target.getTargets'));
-  assert.ok(!methods(calls).includes('Page.getFrameTree'));
   assert.deepEqual(releasedGroups(calls), ['web-access-frames']);
 });
 
@@ -105,7 +112,7 @@ test('frameContext：跨进程 iframe 在它的子 session 中建隔离环境，
   assert.equal(remote.sessionId, 'oopif-frame-session');
   assert.equal(remote.contextId, 22);
   assert.equal(remote.frame.crossProcess, true);
-  const world = oop.calls.find(call => call.method === 'Page.createIsolatedWorld');
+  const world = oop.calls.find(call => call.method === 'Page.createIsolatedWorld' && call.params.frameId === 'oopif-frame');
   assert.deepEqual(world, { method: 'Page.createIsolatedWorld', params: { frameId: 'oopif-frame', worldName: 'web-access' }, sessionId: 'oopif-frame-session' });
 
   const same = fakeBrowser();
@@ -127,7 +134,8 @@ for (const [frameId, pattern] of [
     const { frames, attached, calls } = fakeBrowser();
     await assert.rejects(frames.frameContext('page-1', frameId), error => error instanceof FrameError && pattern.test(error.message));
     assert.ok(attached.every(id => id === 'page-1'), attached.join(','));
-    assert.ok(!methods(calls).includes('Page.createIsolatedWorld'));
+    // 只为页面根 frame 建过隔离环境（用于列举），没有进入任何其他 frame
+    assert.ok(calls.filter(call => call.method === 'Page.createIsolatedWorld').every(call => call.params.frameId === 'page-1'));
   });
 }
 
@@ -206,4 +214,19 @@ test('同一标签页上重叠的 listFrames / routePoint 全部成功，不释�
   const results = await Promise.allSettled(Array.from({ length: 24 }, (_, i) => (i % 2 ? frames.listFrames('page-1') : frames.routePoint('page-1', 10, 10))));
   const failures = results.filter(result => result.status === 'rejected').map(result => result.reason.message);
   assert.deepEqual(failures, []);
+});
+
+// 审查 F4：列举与命中测试在页面根 frame 的隔离环境里执行，页面脚本改写主环境的 DOM API 不影响结果
+test('listFrames 与 routePoint 的 DOM 查询都在根 frame 的隔离环境中执行', async () => {
+  const { frames, calls } = fakeBrowser({ hit: 'el-oopif' });
+  assert.equal((await frames.listFrames('page-1')).length, 3);
+  await frames.routePoint('page-1', 115, 95);
+  const queries = calls.filter(call => call.method === 'Runtime.evaluate' && /querySelectorAll|elementFromPoint/.test(call.params.expression));
+  assert.ok(queries.length >= 2);
+  for (const query of queries) {
+    const world = calls.find(call => call.method === 'Page.createIsolatedWorld' && call.sessionId === query.sessionId);
+    assert.ok(world, '先为该 session 的根 frame 建隔离环境');
+    assert.equal(world.params.frameId, query.sessionId === 'page-session' ? 'page-1' : 'oopif-frame');
+    assert.equal(typeof query.params.contextId, 'number');
+  }
 });
