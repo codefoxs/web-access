@@ -15,7 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { selectBrowser, getConfiguredBrowser, validateBrowser, sameBrowser, browserLabel, explainUnavailable, INSPECT_HINT } from './browser-discovery.mjs';
-import { appDataRoots, listTopFolders } from './browser-probe.mjs';
+import { appDataRoots, listAppDataRoots } from './browser-probe.mjs';
 import { userDataPaths, migrateLegacyData } from './user-data.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -173,12 +173,13 @@ async function ensureProxy(expectedBrowserId, browserOverride, health) {
 
 function printFirstRunGuide() {
   console.log(`browser: 未设置 — 首次使用需要选定浏览器（写入 ${CONFIG_PATH} 的 WEB_ACCESS_BROWSER）`);
-  const roots = appDataRoots();
-  if (!roots.length) console.log(`  当前平台（${os.platform()}）没有已知的应用数据根目录，请向用户询问浏览器数据目录`);
-  for (const root of roots) {
-    const listing = listTopFolders(root);
-    if (listing.code) console.log(`  应用数据根目录 ${root}：无法列出（${listing.code}）`);
-    else console.log(`  应用数据根目录 ${root} 下的文件夹：\n    ${listing.folders.join(', ') || '（空）'}`);
+  const listings = listAppDataRoots();
+  if (!listings.length) {
+    console.log(`  当前平台（${os.platform()}）没有可列出的应用数据根目录（${appDataRoots().join('、') || '未知'}），请向用户询问浏览器数据目录`);
+  }
+  for (const { root, folders, code } of listings) {
+    if (code) console.log(`  应用数据根目录 ${root}：无法列出（${code}）`);
+    else console.log(`  应用数据根目录 ${root} 下的文件夹：\n    ${folders.join(', ') || '（空）'}`);
   }
   console.log('  Agent 下一步：');
   console.log('    1. 从文件夹名认出 Chromium 内核浏览器（如 Google、Microsoft Edge、BraveSoftware、Arc、Dia、Vivaldi、com.operasoftware.Opera）');

@@ -34,6 +34,7 @@ const probe = await import(new URL('./scripts/browser-probe.mjs', import.meta.ur
 let result;
 if (opts.action === 'roots') result = probe.appDataRoots();
 else if (opts.action === 'list') result = probe.listTopFolders(opts.root);
+else if (opts.action === 'listRoots') result = probe.listAppDataRoots();
 else if (opts.action === 'resolve') result = probe.resolveFolder(opts.folder);
 else result = await probe.probeFolder(opts.folder);
 console.log(JSON.stringify(result));
@@ -118,13 +119,13 @@ async function closedPort() {
   return port;
 }
 
-test('应用数据根目录：macOS Application Support、Linux ~/.config、Windows LOCALAPPDATA 与 APPDATA', async t => {
+test('应用数据根目录：macOS Application Support、Linux ~/.config / ~/snap / ~/.var/app、Windows LOCALAPPDATA 与 APPDATA', async t => {
   for (const platform of ['darwin', 'linux', 'win32', 'unsupported-os']) {
     const f = await fixture(t, { platform });
     const { result } = await f.call('roots');
     const expected = {
       darwin: [path.join(f.home, 'Library', 'Application Support')],
-      linux: [path.join(f.home, '.config')],
+      linux: [path.join(f.home, '.config'), path.join(f.home, 'snap'), path.join(f.home, '.var', 'app')],
       win32: [f.localAppData, f.appData],
       'unsupported-os': [],
     }[platform];
@@ -309,4 +310,27 @@ test('被探测的文件夹本身无权限时报告无法读取，不崩溃', { 
   assert.equal(cli.code, 1, cli.stdout + cli.stderr);
   assert.match(cli.stdout, /无法读取该文件夹（EACCES），已跳过/);
   assert.equal(cli.stderr, '');
+});
+
+test('Linux：snap 与 flatpak 的浏览器可按文件夹名探测，首次配置只列存在的根目录', async t => {
+  const f = await fixture(t, { platform: 'linux' });
+  const snap = path.join(f.home, 'snap');
+  const flatpak = path.join(f.home, '.var', 'app');
+  const chromium = await f.browser(snap, 'chromium/common/chromium');
+  const chrome = await f.browser(flatpak, 'com.google.Chrome/config/google-chrome');
+  await f.browser(f.appRoot, 'BraveSoftware/Brave-Browser');
+  const listed = (await f.call('listRoots')).result;
+  assert.deepEqual(listed, [
+    { root: f.appRoot, folders: ['BraveSoftware'] },
+    { root: snap, folders: ['chromium'] },
+    { root: flatpak, folders: ['com.google.Chrome'] },
+  ]);
+  const cli = await f.cli('chromium', 'com.google.Chrome');
+  assert.equal(cli.code, 0, cli.stdout + cli.stderr);
+  assert.ok(cli.stdout.includes(`- chromium：${chromium}`), cli.stdout);
+  assert.ok(cli.stdout.includes(`- google-chrome：${chrome}`), cli.stdout);
+  // 只有 ~/.config 时其余两个根目录不出现在列表里
+  await fs.rm(snap, { recursive: true });
+  await fs.rm(path.join(f.home, '.var'), { recursive: true });
+  assert.deepEqual((await f.call('listRoots')).result, [{ root: f.appRoot, folders: ['BraveSoftware'] }]);
 });

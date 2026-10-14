@@ -66,7 +66,7 @@ WEB_ACCESS_BROWSER=chrome
 
 ## 3. 首次配置
 
-`WEB_ACCESS_BROWSER` 为空、且没有可复用的共享服务时，前置检查以 `exit 2` 结束，并输出应用数据根目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`）的最外层文件夹名，不进入任何文件夹。Agent 接着：
+`WEB_ACCESS_BROWSER` 为空、且没有可复用的共享服务时，前置检查以 `exit 2` 结束，并输出应用数据根目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`，以及 snap 的 `~/snap`、flatpak 的 `~/.var/app`）的最外层文件夹名，不进入任何文件夹。Agent 接着：
 
 1. 从文件夹名认出 Chromium 内核浏览器
 2. 只探测认出的文件夹：`node "<skill路径>/scripts/browser-probe.mjs" <文件夹名> [更多文件夹名]`（只接受应用数据根目录下的相对路径）

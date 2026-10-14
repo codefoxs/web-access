@@ -20,12 +20,13 @@ import { checkPort, displayName, readActivePort, INSPECT_HINT } from './browser-
 const MAX_DEPTH = 3;
 const MAX_DIRS = 500; // 防止误指向巨大目录时无界遍历
 
-// 各平台应用数据根目录（浏览器数据目录通常在其下 1～3 层）
+// 各平台应用数据根目录（浏览器数据目录通常在其下 1～3 层）。
+// Linux 另含 snap（~/snap/<应用>/…）与 flatpak（~/.var/app/<应用 id>/…）的沙盒数据目录。
 export function appDataRoots() {
   const home = os.homedir();
   switch (os.platform()) {
     case 'darwin': return [path.join(home, 'Library', 'Application Support')];
-    case 'linux': return [path.join(home, '.config')];
+    case 'linux': return [path.join(home, '.config'), path.join(home, 'snap'), path.join(home, '.var', 'app')];
     case 'win32': return [process.env.LOCALAPPDATA, process.env.APPDATA].filter(Boolean);
     default: return [];
   }
@@ -42,6 +43,11 @@ export function listTopFolders(root) {
   } catch (error) {
     return { root, code: error.code || 'EIO' };
   }
+}
+
+// 首次配置的列表：每个存在的根目录及其最外层文件夹名；不存在的根目录（如没有 snap 的 Linux）不列出
+export function listAppDataRoots() {
+  return appDataRoots().map(listTopFolders).filter(listing => listing.code !== 'ENOENT');
 }
 
 // target 是否严格位于 base 之内（不等于 base 本身）
