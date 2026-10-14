@@ -101,18 +101,33 @@ test('插件按版本分目录：只取最新的 web-access 旧版本，不吸�
 
 test('当前目录与兄弟旧版本都有数据时合并，当前目录优先且不覆盖', async t => {
   const s = await sandbox(t);
-  const parent = path.join(s.root, 'skills');
-  await skillDir(path.join(parent, 'web-access-old'), { config: 'WEB_ACCESS_BROWSER=chrome\n', patterns: { 'a.com.md': 'sibling', 'b.com.md': 'sibling' } });
-  const current = await skillDir(path.join(parent, 'web-access'), { config: 'WEB_ACCESS_BROWSER=edge\n', patterns: { 'a.com.md': 'current' } });
+  const parent = path.join(s.root, 'cache', 'web-access');
+  await skillDir(path.join(parent, '2.5.4'), { config: 'WEB_ACCESS_BROWSER=chrome\n', patterns: { 'a.com.md': 'sibling', 'b.com.md': 'sibling' } });
+  const current = await skillDir(path.join(parent, '2.6.0'), { config: 'WEB_ACCESS_BROWSER=edge\n', patterns: { 'a.com.md': 'current' } });
   const result = migrateLegacyData({ root: current, home: s.home });
   assert.deepEqual(result.sources, [
     { from: current, config: true, patterns: 1 },
-    { from: path.join(parent, 'web-access-old'), config: false, patterns: 1 },
+    { from: path.join(parent, '2.5.4'), config: false, patterns: 1 },
   ]);
   assert.equal(await read(s.target.config), 'WEB_ACCESS_BROWSER=edge\n');
   assert.equal(await read(path.join(s.target.sitePatterns, 'a.com.md')), 'current');
   assert.equal(await read(path.join(s.target.sitePatterns, 'b.com.md')), 'sibling');
 });
+
+for (const parentName of ['skills', 'home']) {
+  test(`父目录不是 web-access（${parentName}）时不扫描兄弟目录，只迁移当前目录`, async t => {
+    const s = await sandbox(t);
+    const parent = parentName === 'home' ? s.home : path.join(s.root, 'skills');
+    // 兄弟目录看起来就是 web-access 旧版本，也不应被读取
+    await skillDir(path.join(parent, 'web-access-old'), { config: 'WEB_ACCESS_BROWSER=chrome\n', patterns: { 'old.com.md': 'sibling' } });
+    await skillDir(path.join(parent, 'Desktop'), { config: 'WEB_ACCESS_BROWSER=edge\n' });
+    const current = await skillDir(path.join(parent, 'web-access'), { patterns: { 'a.com.md': 'current' } });
+    const result = migrateLegacyData({ root: current, home: s.home });
+    assert.deepEqual(result.sources, [{ from: current, config: false, patterns: 1 }]);
+    assert.equal(await exists(s.target.config), false);
+    assert.deepEqual(await fs.readdir(s.target.sitePatterns), ['a.com.md']);
+  });
+}
 
 test('新位置已存在的文件不被旧副本覆盖', async t => {
   const s = await sandbox(t);

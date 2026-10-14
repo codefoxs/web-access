@@ -6,8 +6,9 @@
 //
 // 迁移规则（新目录没有 .migrated 标记时执行一次，之后不再扫描，避免已删除的文件被旧副本复活）：
 //   来源 1：当前 Skill 根目录下的 config.env 与 references/site-patterns/（git 安装升级后旧文件仍在原处）
-//   来源 2：相邻兄弟目录中 SKILL.md frontmatter name 为 web-access 的旧版本（插件按版本分目录），
-//           只取含用户数据且修改时间最新的一个
+//   来源 2：插件缓存按版本分目录（<…>/web-access/<版本>/）时，相邻兄弟目录中 SKILL.md frontmatter
+//           name 为 web-access 的旧版本，只取含用户数据且修改时间最新的一个。只有父目录名为 web-access
+//           才扫描，Skill 直接放在 HOME 等普通目录下时不去读 ~/Desktop 等兄弟目录
 //   只复制不删除；目标已存在的文件不覆盖；来源 1 优先。
 
 import fs from 'node:fs';
@@ -74,9 +75,11 @@ function isWebAccessSkill(dir) {
   return !!front && new RegExp(`^name:\\s*["']?${SKILL_NAME}["']?\\s*$`, 'm').test(front[1]);
 }
 
-// 相邻目录中含用户数据且最新的 web-access 旧版本（不跟随符号链接）
+// 相邻目录中含用户数据且最新的 web-access 旧版本（不跟随符号链接）。
+// 只认插件缓存的 <plugin>/<version>/ 布局（父目录名为 web-access），其他位置不扫描兄弟目录。
 function newestSibling(root) {
   const parent = path.dirname(root);
+  if (path.basename(parent) !== SKILL_NAME) return null;
   let newest = null;
   for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
