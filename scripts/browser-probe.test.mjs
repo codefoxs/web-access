@@ -234,3 +234,43 @@ test('命令行输出数据目录、调试状态与可直接写入的配置行�
   assert.match(none.stdout, /应用数据根目录下没有这个文件夹/);
   assert.equal((await f.cli()).code, 2);
 });
+
+// 权限拒绝只能在非 root 的 POSIX 上用 chmod 构造
+const canChmod = process.platform !== 'win32' && process.getuid?.() !== 0;
+
+test('无权限的子文件夹只跳过并注明，同一文件夹里其他可读的浏览器照常报告', { skip: !canChmod && '需要非 root 的 POSIX' }, async t => {
+  const f = await fixture(t);
+  const server = await fakeHttp(t);
+  const vendor = path.join(f.appRoot, 'Vendor');
+  const browser = await f.browser(vendor, 'Browser/User Data', `${server.port}\n/x\n`);
+  const locked = path.join(vendor, 'Locked');
+  await fs.mkdir(locked);
+  await fs.chmod(locked, 0o000);
+  let result;
+  let cli;
+  // 在测试体内恢复权限，保证临时目录能被清理
+  try {
+    ({ result } = await f.call('probe', { folder: vendor }));
+    cli = await f.cli('Vendor');
+  } finally { await fs.chmod(locked, 0o755); }
+  assert.deepEqual(result.browsers.map(item => item.dataDir), [browser]);
+  assert.equal(result.browsers[0].remoteDebugging.enabled, true);
+  assert.deepEqual(result.skipped, [{ dir: locked, code: 'EACCES' }]);
+  assert.equal(cli.code, 0, cli.stdout + cli.stderr);
+  assert.ok(cli.stdout.includes(`无法读取，已跳过（EACCES）：${locked}`), cli.stdout);
+  assert.ok(cli.stdout.includes(`WEB_ACCESS_BROWSER=${browser}`), cli.stdout);
+  assert.equal(cli.stderr, '');
+});
+
+test('被探测的文件夹本身无权限时报告无法读取，不崩溃', { skip: !canChmod && '需要非 root 的 POSIX' }, async t => {
+  const f = await fixture(t);
+  const locked = path.join(f.appRoot, 'Locked');
+  await f.browser(locked, 'User Data');
+  await fs.chmod(locked, 0o000);
+  let cli;
+  try { cli = await f.cli('Locked'); }
+  finally { await fs.chmod(locked, 0o755); }
+  assert.equal(cli.code, 1, cli.stdout + cli.stderr);
+  assert.match(cli.stdout, /无法读取该文件夹（EACCES），已跳过/);
+  assert.equal(cli.stderr, '');
+});

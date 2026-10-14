@@ -50,6 +50,7 @@ export function resolveFolder(arg) {
   return appDataRoots().map(root => path.join(root, expanded)).filter(dir => fs.existsSync(dir));
 }
 
+// 只判断 `Local State` 是否存在；无权限（EACCES / EPERM）时抛出，由调用方把该目录记为跳过
 function hasLocalState(dir) {
   return fs.statSync(path.join(dir, 'Local State'), { throwIfNoEntry: false })?.isFile() === true;
 }
@@ -84,18 +85,22 @@ export async function probeFolder(folder) {
   while (queue.length) {
     const { dir, depth } = queue.shift();
     if (++visited > MAX_DIRS) return { folder, browsers, skipped, truncated: true };
-    if (hasLocalState(dir)) {
-      browsers.push(await describe(dir));
-      continue;
-    }
-    if (depth >= MAX_DEPTH) continue;
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
-    catch (error) {
+    let isBrowser = false;
+    let entries = null;
+    try {
+      isBrowser = hasLocalState(dir);
+      if (!isBrowser && depth < MAX_DEPTH) entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (error) {
+      // 无权限的目录（macOS TCC、root 所有、Windows ACL）只跳过它自己，同一文件夹里其他浏览器照常报告
       if (depth === 0) return { folder, code: error.code || 'EIO' };
       skipped.push({ dir, code: error.code || 'EIO' });
       continue;
     }
+    if (isBrowser) {
+      browsers.push(await describe(dir));
+      continue;
+    }
+    if (!entries) continue;
     for (const entry of entries) {
       if (entry.isDirectory()) queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
     }
@@ -106,7 +111,7 @@ export async function probeFolder(folder) {
 function printProbe(result) {
   console.log(`probe: ${result.folder}`);
   if (result.code) {
-    console.log(`  无法读取该文件夹（${result.code}）`);
+    console.log(`  无法读取该文件夹（${result.code}），已跳过`);
     return;
   }
   if (!result.browsers.length) {
@@ -120,7 +125,7 @@ function printProbe(result) {
       : `    远程调试：未开启 — ${state.detail}；需用户在该浏览器${INSPECT_HINT}`);
     console.log(`    配置写法：WEB_ACCESS_BROWSER=${browser.dataDir}`);
   }
-  for (const item of result.skipped) console.log(`  跳过无法读取的子文件夹（${item.code}）：${item.dir}`);
+  for (const item of result.skipped) console.log(`  无法读取，已跳过（${item.code}）：${item.dir}`);
   if (result.truncated) console.log(`  文件夹过大，已在 ${MAX_DIRS} 个目录后停止；请指定更具体的子文件夹`);
 }
 
