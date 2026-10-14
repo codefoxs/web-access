@@ -166,6 +166,13 @@ curl -s -X POST "http://localhost:3456/click?target=ID" -d 'button.submit'
 # 真实鼠标点击 — CDP Input.dispatchMouseEvent，算用户手势，能触发文件对话框
 curl -s -X POST "http://localhost:3456/clickAt?target=ID" -d 'button.upload'
 
+# 按视口坐标真实点击 — 可点中跨站 iframe 里的元素，不激活标签页
+curl -s "http://localhost:3456/clickXY?target=ID&x=120&y=90"
+
+# 页面里的 iframe — 列出 frameId（跨站 iframe 标 crossProcess），再在其中执行 JS
+curl -s "http://localhost:3456/frames?target=ID"
+curl -s -X POST "http://localhost:3456/eval?target=ID&frame=FRAME_ID" -d 'document.body.innerText'
+
 # 文件上传 — 直接设置 file input 的本地文件路径，绕过文件对话框
 curl -s -X POST "http://localhost:3456/setFiles?target=ID" -d '{"selector":"input[type=file]","files":["/path/to/file.png"]}'
 
@@ -195,6 +202,7 @@ curl -s "http://localhost:3456/close?target=ID"
 ### 技术事实
 - 页面中存在大量已加载但未展示的内容——轮播中非当前帧的图片、折叠区块的文字、懒加载占位元素等，它们存在于 DOM 中但对用户不可见。以数据结构（容器、属性、节点关系）为单位思考，可以直接触达这些内容。
 - DOM 中存在选择器不可跨越的边界（Shadow DOM 的 `shadowRoot`、iframe 的 `contentDocument`等）。eval 递归遍历可一次穿透所有层级，返回带标签的结构化内容，适合快速了解未知页面的完整结构。
+- 跨站 iframe（支付、登录、嵌入的第三方组件）在另一个进程里，父页面读不到它的 `contentDocument`，选择器点击也进不去。`/frames` 列出页面的 iframe 和 `frameId`，`/eval?frame=` 在其中执行（隔离环境，共享 DOM，看不到页面的 JS 变量），`/clickXY` 按视口坐标点中其中的元素。
 - `/scroll` 到底部会触发懒加载，使未进入视口的图片完成加载。提取图片 URL 前若未滚动，部分图片可能尚未加载。
 - 拿到媒体资源 URL 后，公开资源可直接下载到本地后用读取；需要登录态才可获取的资源才需要在浏览器内 navigate + screenshot。
 - 短时间内密集打开大量页面（如批量 `/new`）可能触发网站的反爬风控。

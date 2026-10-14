@@ -1,0 +1,159 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { createPageFrames, FrameError } from './page-frames.mjs';
+
+// 进程内假浏览器：按 CDP 方法返回固定结构，记录每次调用（方法、参数、session），不连接任何浏览器。
+// 页面 page-1 主文档里有三个 iframe：同进程 local-frame、跨进程 oopif-frame、尚未加载的第三个。
+function fakeBrowser({ hit = null, errors = {} } = {}) {
+  const calls = [];
+  const attached = [];
+  const ensureSession = async targetId => {
+    attached.push(targetId);
+    return targetId === 'page-1' ? 'page-session' : `${targetId}-session`;
+  };
+  const send = async (method, params = {}, sessionId = null) => {
+    calls.push({ method, params, sessionId });
+    if (errors[method]) return { error: { message: errors[method] } };
+    switch (method) {
+      case 'Runtime.evaluate':
+        if (params.expression.includes('querySelectorAll')) return { result: { result: { objectId: 'node-list' } } };
+        if (params.expression.includes('elementFromPoint')) return { result: { result: hit ? { objectId: hit } : { type: 'object', subtype: 'null' } } };
+        break;
+      case 'Runtime.getProperties':
+        // 故意乱序，并混入非下标属性
+        return { result: { result: [
+          { name: '2', value: { objectId: 'el-unloaded' } },
+          { name: 'length', value: { value: 3 } },
+          { name: '0', value: { objectId: 'el-local' } },
+          { name: '1', value: { objectId: 'el-oopif' } },
+        ] } };
+      case 'Target.getTargets':
+        return { result: { targetInfos: [
+          { targetId: 'page-1', type: 'page', url: 'http://localhost/p' },
+          { targetId: 'oopif-frame', type: 'iframe', url: 'http://127.0.0.1/child' },
+          { targetId: 'page-2', type: 'page', url: 'http://other/' },
+        ] } };
+      case 'Page.getFrameTree':
+        return { result: { frameTree: { frame: { id: 'page-1' }, childFrames: [
+          { frame: { id: 'local-frame', url: 'http://localhost/same-now', name: 'kid' } },
+        ] } } };
+      case 'DOM.describeNode': {
+        const nodes = {
+          'el-local': { frameId: 'local-frame', attributes: ['name', 'kid', 'src', '/same'] },
+          'el-oopif': { frameId: 'oopif-frame', attributes: ['id', 'pay', 'src', 'http://127.0.0.1/child', 'style', 'x'] },
+          'el-unloaded': { attributes: ['src', 'about:blank#later'] },
+          'el-button': { attributes: ['id', 'b'] },
+        };
+        return { result: { node: nodes[params.objectId] } };
+      }
+      case 'Page.createIsolatedWorld':
+        return { result: { executionContextId: sessionId === 'page-session' ? 11 : 22 } };
+      case 'Runtime.callFunctionOn':
+        return { result: { result: { value: { x: 55, y: 65 } } } };
+      case 'Page.captureScreenshot':
+        return { result: { data: 'AA==' } };
+    }
+    return { result: {} };
+  };
+  return { frames: createPageFrames({ send, ensureSession }), calls, attached };
+}
+
+const methods = calls => calls.map(call => call.method);
+const releasedGroups = calls => calls.filter(call => call.method === 'Runtime.releaseObjectGroup').map(call => call.params.objectGroup);
+
+test('listFrames 按文档顺序列出主文档 iframe：跨进程标记、当前网址与定位线索，用完释放临时对象', async () => {
+  const { frames, calls, attached } = fakeBrowser();
+  assert.deepEqual(await frames.listFrames('page-1'), [
+    { index: 0, frameId: 'local-frame', crossProcess: false, url: 'http://localhost/same-now', name: 'kid', src: '/same' },
+    { index: 1, frameId: 'oopif-frame', crossProcess: true, url: 'http://127.0.0.1/child', id: 'pay', src: 'http://127.0.0.1/child' },
+    { index: 2, frameId: null, crossProcess: false, url: 'about:blank#later', src: 'about:blank#later' },
+  ]);
+  assert.deepEqual(attached, ['page-1']);
+  assert.ok(calls.filter(call => call.method !== 'Target.getTargets').every(call => call.sessionId === 'page-session'));
+  assert.deepEqual(releasedGroups(calls), ['web-access-frames']);
+});
+
+test('页面没有 iframe 时返回空数组，不查询 target 与 frame 树', async () => {
+  const calls = [];
+  const frames = createPageFrames({
+    ensureSession: async () => 'page-session',
+    send: async (method, params, sessionId) => {
+      calls.push({ method, params, sessionId });
+      if (method === 'Runtime.evaluate') return { result: { result: { objectId: 'node-list' } } };
+      if (method === 'Runtime.getProperties') return { result: { result: [{ name: 'length', value: { value: 0 } }] } };
+      return { result: {} };
+    },
+  });
+  assert.deepEqual(await frames.listFrames('page-1'), []);
+  assert.ok(!methods(calls).includes('Target.getTargets'));
+  assert.ok(!methods(calls).includes('Page.getFrameTree'));
+  assert.deepEqual(releasedGroups(calls), ['web-access-frames']);
+});
+
+test('frameContext：跨进程 iframe 在它的子 session 中建隔离环境，同进程 iframe 用页面 session', async () => {
+  const oop = fakeBrowser();
+  const remote = await oop.frames.frameContext('page-1', 'oopif-frame');
+  assert.equal(remote.sessionId, 'oopif-frame-session');
+  assert.equal(remote.contextId, 22);
+  assert.equal(remote.frame.crossProcess, true);
+  const world = oop.calls.find(call => call.method === 'Page.createIsolatedWorld');
+  assert.deepEqual(world, { method: 'Page.createIsolatedWorld', params: { frameId: 'oopif-frame', worldName: 'web-access' }, sessionId: 'oopif-frame-session' });
+
+  const same = fakeBrowser();
+  const local = await same.frames.frameContext('page-1', 'local-frame');
+  assert.equal(local.sessionId, 'page-session');
+  assert.equal(local.contextId, 11);
+  assert.ok(!same.attached.includes('local-frame'));
+});
+
+for (const [frameId, pattern] of [
+  ['', /应为 \/frames 返回的 frameId/],
+  ['#pay', /应为 \/frames 返回的 frameId/],
+  ['a b', /应为 \/frames 返回的 frameId/],
+  [undefined, /应为 \/frames 返回的 frameId/],
+  ['page-2', /该页面没有 frameId 为 page-2/],
+  ['page-1', /该页面没有 frameId 为 page-1/],
+]) {
+  test(`frameContext 拒绝 ${JSON.stringify(frameId)}：只接受本页面主文档里 iframe 的 frameId，不 attach 其他目标`, async () => {
+    const { frames, attached, calls } = fakeBrowser();
+    await assert.rejects(frames.frameContext('page-1', frameId), error => error instanceof FrameError && pattern.test(error.message));
+    assert.ok(attached.every(id => id === 'page-1'), attached.join(','));
+    assert.ok(!methods(calls).includes('Page.createIsolatedWorld'));
+  });
+}
+
+test('routePoint：没有命中元素或命中普通元素时，坐标不变发给页面', async () => {
+  for (const hit of [null, 'el-button']) {
+    const { frames, calls } = fakeBrowser({ hit });
+    assert.deepEqual(await frames.routePoint('page-1', 12, 34), { sessionId: 'page-session', x: 12, y: 34 });
+    assert.ok(!methods(calls).includes('Page.captureScreenshot'));
+    assert.deepEqual(releasedGroups(calls), ['web-access-click']);
+  }
+});
+
+test('routePoint：命中跨进程 iframe 时扣除 iframe 位置与边框，路由到子 session', async () => {
+  const { frames, calls, attached } = fakeBrowser({ hit: 'el-oopif' });
+  assert.deepEqual(await frames.routePoint('page-1', 115, 95), {
+    sessionId: 'oopif-frame-session', x: 60, y: 30, frameId: 'oopif-frame', crossProcess: true,
+  });
+  assert.deepEqual(attached, ['page-1', 'oopif-frame']);
+  const offset = calls.find(call => call.method === 'Runtime.callFunctionOn');
+  assert.equal(offset.params.objectId, 'el-oopif');
+  assert.deepEqual(releasedGroups(calls), ['web-access-click']);
+});
+
+test('routePoint：命中同进程 iframe 时先触发一次绘制，再按原坐标发给页面', async () => {
+  const { frames, calls } = fakeBrowser({ hit: 'el-local' });
+  assert.deepEqual(await frames.routePoint('page-1', 450, 80), {
+    sessionId: 'page-session', x: 450, y: 80, frameId: 'local-frame', crossProcess: false,
+  });
+  const shot = calls.find(call => call.method === 'Page.captureScreenshot');
+  assert.equal(shot.sessionId, 'page-session');
+  assert.equal(shot.params.quality, 1);
+});
+
+test('CDP 错误带方法名抛出，临时对象组仍被释放', async () => {
+  const { frames, calls } = fakeBrowser({ errors: { 'Runtime.getProperties': 'Object reference chain is too long' } });
+  await assert.rejects(frames.listFrames('page-1'), /Runtime\.getProperties: Object reference chain is too long/);
+  assert.deepEqual(releasedGroups(calls), ['web-access-frames']);
+});

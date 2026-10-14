@@ -88,6 +88,17 @@ curl -s "http://localhost:3456/info?target=ID"
 curl -s -X POST "http://localhost:3456/eval?target=ID" -d 'document.title'
 ```
 
+可选 `frame=FRAME_ID`（取自 `/frames`）：在页面里的这个 iframe 中执行，跨站（跨进程）iframe 也可以，不必另开 iframe 的网址。代码在该 iframe 的隔离环境中运行：能读写 iframe 的 DOM，看不到页面自己的 JS 全局变量。`frameId` 不属于该页面主文档的 iframe 时返回 `400`。不带 `frame` 时行为与以前完全相同。
+```bash
+curl -s -X POST "http://localhost:3456/eval?target=ID&frame=FRAME_ID" -d 'document.body.innerText'
+```
+
+### GET /frames?target=ID
+列出页面主文档里直接的 `<iframe>` / `<frame>`（不递归嵌套），按文档顺序返回数组：`index`、`frameId`（尚未加载为 `null`）、`url`（当前网址）、`crossProcess`（是否跨进程，即跨站 iframe），以及可选的定位线索 `id` / `name` / `src`（元素属性原值）。`frameId` 只含字母数字等网址安全字符，可直接放进 `/eval` 的查询参数。
+```bash
+curl -s "http://localhost:3456/frames?target=ID"
+```
+
 ### POST /click?target=ID
 JS 层面点击（`el.click()`），POST body 为 CSS 选择器。自动 scrollIntoView 后点击。简单快速，覆盖大多数场景。
 ```bash
@@ -98,6 +109,12 @@ curl -s -X POST "http://localhost:3456/click?target=ID" -d 'button.submit'
 CDP 浏览器级真实鼠标点击（`Input.dispatchMouseEvent`），POST body 为 CSS 选择器。先获取元素坐标，再模拟鼠标按下/释放。算真实用户手势，能触发文件对话框、绕过部分反自动化检测。
 ```bash
 curl -s -X POST "http://localhost:3456/clickAt?target=ID" -d 'button.upload'
+```
+
+### GET /clickXY?target=ID&x=120&y=90
+按页面视口坐标发送真实鼠标事件（移动、按下、松开），不激活标签页。坐标命中跨进程 iframe 时，换算成 iframe 内的坐标并发给该 iframe，只路由命中的那一层。`x`、`y` 必须是有限的非负数，否则返回 `400`。返回 `{ clicked, x, y }`，命中 iframe 时另含 `frameId` 与 `crossProcess`。坐标可用 `/eval` 取元素的 `getBoundingClientRect()` 得到；iframe 内的元素要加上 iframe 在页面中的位置。
+```bash
+curl -s "http://localhost:3456/clickXY?target=ID&x=120&y=90"
 ```
 
 ### POST /setFiles?target=ID

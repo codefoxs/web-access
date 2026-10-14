@@ -78,14 +78,67 @@ class FakeWebSocket extends EventTarget {
   }
   send(text) {
     const message = JSON.parse(text);
-    record('command', { method: message.method, id: message.id });
+    const { contextId, targetId, x, y } = message.params || {};
+    record('command', { method: message.method, id: message.id, sessionId: message.sessionId, contextId, targetId, x, y });
     void this.respond(message);
   }
+  reply(message, payload) {
+    this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ id: message.id, ...payload }) }));
+  }
+  // TEST_FRAMES=1：页面 user-page 有同进程 iframe local-frame 与跨进程 iframe oopif-frame（子 session 按 attach 次数编号）
+  respondFrames(message) {
+    const params = message.params || {};
+    switch (message.method) {
+      case 'Target.attachToTarget':
+        if (params.targetId === 'oopif-frame') return { sessionId: 'frame-session-' + (this.frameAttaches = (this.frameAttaches || 0) + 1) };
+        return null;
+      case 'Runtime.evaluate':
+        if (params.contextId) return { result: { value: 'frame:' + message.sessionId } };
+        if (params.expression.includes('querySelectorAll')) return { result: { objectId: 'node-list' } };
+        if (params.expression.includes('elementFromPoint')) return { result: { objectId: 'el-oopif' } };
+        return null;
+      case 'Runtime.getProperties':
+        return { result: [{ name: '0', value: { objectId: 'el-local' } }, { name: '1', value: { objectId: 'el-oopif' } }] };
+      case 'DOM.describeNode':
+        return { node: params.objectId === 'el-local'
+          ? { frameId: 'local-frame', attributes: ['name', 'kid'] }
+          : { frameId: 'oopif-frame', attributes: ['id', 'pay'] } };
+      case 'Page.getFrameTree':
+        return { frameTree: { frame: { id: 'user-page' }, childFrames: [{ frame: { id: 'local-frame', url: 'http://localhost/same' } }] } };
+      case 'Page.createIsolatedWorld':
+        return { executionContextId: 7 };
+      case 'Runtime.callFunctionOn':
+        return { result: { value: { x: 55, y: 65 } } };
+    }
+    return null;
+  }
   async respond(message) {
+    // 已被浏览器解除的 session：与真实 Chrome 一样报错
+    if (message.sessionId && this.dead?.has(message.sessionId)) {
+      this.reply(message, { error: { code: -32001, message: 'Session with given id not found.' } });
+      record('response', { method: message.method, error: true });
+      return;
+    }
+    if (process.env.TEST_FRAMES === '1') {
+      const result = this.respondFrames(message);
+      if (result) {
+        this.reply(message, { result });
+        record('response', { method: message.method });
+        // TEST_DETACH_FRAME=1：第一次在子 session 中执行后，浏览器解除该 session（模拟 iframe 换进程）
+        if (process.env.TEST_DETACH_FRAME === '1' && message.method === 'Runtime.evaluate' && message.params.contextId && !this.dead) {
+          this.dead = new Set([message.sessionId]);
+          this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ method: 'Target.detachedFromTarget', params: { sessionId: message.sessionId, targetId: 'oopif-frame' } }) }));
+        }
+        return;
+      }
+    }
     if (message.method === 'Target.getTargets' && process.env.TEST_HOLD_TARGETS === '1') await waitBarrier('targets');
     if (message.method === 'Fetch.failRequest' && process.env.TEST_BACKGROUND_PENDING === '1') await waitBarrier('pending');
     let result = {};
-    if (message.method === 'Target.getTargets') result = { targetInfos: [{ targetId: 'user-page', type: 'page', title: 'Fake page', url: 'about:blank' }] };
+    if (message.method === 'Target.getTargets') {
+      result = { targetInfos: [{ targetId: 'user-page', type: 'page', title: 'Fake page', url: 'about:blank' }] };
+      if (process.env.TEST_FRAMES === '1') result.targetInfos.push({ targetId: 'oopif-frame', type: 'iframe', url: 'http://127.0.0.1/child' });
+    }
     if (message.method === 'Target.createTarget') result = { targetId: 'managed-page' };
     if (message.method === 'Target.closeTarget') result = { success: true };
     if (message.method === 'Target.attachToTarget') result = { sessionId: 'fake-session' };
@@ -137,7 +190,7 @@ async function fixture(t, flags = {}) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'web-access-proxy-'));
   const scripts = path.join(root, 'scripts');
   await fsp.mkdir(scripts);
-  for (const name of ['cdp-proxy.mjs', 'cdp-connection.mjs', 'user-data.mjs']) {
+  for (const name of ['cdp-proxy.mjs', 'cdp-connection.mjs', 'page-frames.mjs', 'user-data.mjs']) {
     await fsp.copyFile(path.join(SCRIPTS, name), path.join(scripts, name));
   }
   await fsp.writeFile(path.join(scripts, 'fake-runtime.mjs'), RUNTIME);
@@ -427,3 +480,78 @@ for (const { name, select, pattern } of [
     assert.equal((await entry.exited).code, 0);
   });
 }
+
+const commandsOf = (events, method) => events.filter(event => event.action === 'command' && event.method === method);
+
+test('/frames 列出 iframe；/eval?frame= 在跨进程 iframe 的子 session 中执行，不带 frame 的 /eval 参数不变', { timeout: 12000 }, async t => {
+  const f = await fixture(t, { TEST_FRAMES: '1' });
+  const entry = f.spawn();
+  await f.ready(entry);
+  const frames = await requestJson(f.port, '/frames?target=user-page');
+  assert.equal(frames.status, 200);
+  assert.deepEqual(frames.body.map(frame => [frame.frameId, frame.crossProcess, frame.url]), [
+    ['local-frame', false, 'http://localhost/same'],
+    ['oopif-frame', true, 'http://127.0.0.1/child'],
+  ]);
+  const inFrame = await requestJson(f.port, '/eval?target=user-page&frame=oopif-frame', { method: 'POST', body: 'document.title' });
+  assert.deepEqual(inFrame.body, { value: 'frame:frame-session-1' });
+  const plain = await requestJson(f.port, '/eval?target=user-page', { method: 'POST', body: 'document.title' });
+  assert.deepEqual(plain.body, { value: 'fake value' });
+  const evaluations = commandsOf(await f.events(), 'Runtime.evaluate').filter(event => !event.contextId && event.sessionId === 'fake-session');
+  assert.ok(evaluations.length >= 1);
+  const health = (await requestJson(f.port, '/health')).body;
+  assert.equal(health.managedTabs, 0);
+  assert.equal(health.activeRequests, 0);
+  assert.equal((await shutdown(f, health)).status, 202);
+  assert.equal((await entry.exited).code, 0);
+});
+
+test('/eval?frame= 只接受本页面 iframe 的 frameId，其他目标或格式错误返回 400 且不 attach', { timeout: 12000 }, async t => {
+  const f = await fixture(t, { TEST_FRAMES: '1' });
+  const entry = f.spawn();
+  const health = await f.ready(entry);
+  for (const frame of ['user-page', 'other-page', '%23pay', '']) {
+    const response = await requestJson(f.port, `/eval?target=user-page&frame=${frame}`, { method: 'POST', body: '1' });
+    assert.equal(response.status, 400, frame);
+    assert.match(response.body.error, /frame/);
+  }
+  const attached = commandsOf(await f.events(), 'Target.attachToTarget').map(event => event.targetId);
+  assert.ok(attached.every(id => id === 'user-page'), attached.join(','));
+  assert.equal(commandsOf(await f.events(), 'Page.createIsolatedWorld').length, 0);
+  assert.equal((await requestJson(f.port, '/frames')).status, 400);
+  assert.equal((await shutdown(f, health)).status, 202);
+  assert.equal((await entry.exited).code, 0);
+});
+
+test('/clickXY 校验参数；命中跨进程 iframe 时鼠标事件扣除偏移后发给子 session', { timeout: 12000 }, async t => {
+  const f = await fixture(t, { TEST_FRAMES: '1' });
+  const entry = f.spawn();
+  const health = await f.ready(entry);
+  for (const query of ['x=1&y=1', 'target=user-page&y=1', 'target=user-page&x=-1&y=1', 'target=user-page&x=abc&y=1', 'target=user-page&x=Infinity&y=1', 'target=user-page&x=%20&y=1']) {
+    const response = await requestJson(f.port, `/clickXY?${query}`);
+    assert.equal(response.status, 400, query);
+    assert.match(response.body.error, /x、y/);
+  }
+  assert.equal(commandsOf(await f.events(), 'Input.dispatchMouseEvent').length, 0);
+  const response = await requestJson(f.port, '/clickXY?target=user-page&x=115&y=95');
+  assert.deepEqual(response.body, { clicked: true, x: 115, y: 95, frameId: 'oopif-frame', crossProcess: true });
+  const mouse = commandsOf(await f.events(), 'Input.dispatchMouseEvent');
+  assert.equal(mouse.length, 3);
+  assert.ok(mouse.every(event => event.sessionId === 'frame-session-1' && event.x === 60 && event.y === 30), JSON.stringify(mouse));
+  assert.equal(commandsOf(await f.events(), 'Target.activateTarget').length, 0);
+  assert.equal((await shutdown(f, health)).status, 202);
+  assert.equal((await entry.exited).code, 0);
+});
+
+test('浏览器解除子 session 后从缓存删除，下一次重新 attach，不复用失效的 session', { timeout: 12000 }, async t => {
+  const f = await fixture(t, { TEST_FRAMES: '1', TEST_DETACH_FRAME: '1' });
+  const entry = f.spawn();
+  const health = await f.ready(entry);
+  const first = await requestJson(f.port, '/eval?target=user-page&frame=oopif-frame', { method: 'POST', body: '1' });
+  assert.deepEqual(first.body, { value: 'frame:frame-session-1' });
+  const second = await requestJson(f.port, '/eval?target=user-page&frame=oopif-frame', { method: 'POST', body: '1' });
+  assert.deepEqual(second.body, { value: 'frame:frame-session-2' });
+  assert.equal(commandsOf(await f.events(), 'Target.attachToTarget').filter(event => event.targetId === 'oopif-frame').length, 2);
+  assert.equal((await shutdown(f, health)).status, 202);
+  assert.equal((await entry.exited).code, 0);
+});

@@ -8,10 +8,11 @@
 - 首次配置：列应用数据根目录的最外层文件夹名、在指定文件夹内探测数据目录 → `scripts/browser-probe.mjs`
 - 用户数据位置（`~/.web-access/`）与旧版本数据一次性迁移 → `scripts/user-data.mjs`
 - HTTP API、标签页生命周期和服务维护门 → `scripts/cdp-proxy.mjs`
+- 页面中的 iframe（列举、在其中执行、坐标点击路由到跨进程 iframe 的子 session）→ `scripts/page-frames.mjs`
 - 唯一 CDP 连接所有者、并发握手、命令结算 → `scripts/cdp-connection.mjs`
 - 跨平台集中维护 → `scripts/proxy-maintenance.mjs`
 - API 契约 → `references/cdp-api.md`
-- 回归验证 → `node --test scripts/check-deps.test.mjs scripts/cdp-connection.test.mjs scripts/cdp-proxy.test.mjs scripts/proxy-maintenance.test.mjs scripts/browser-discovery.test.mjs scripts/browser-probe.test.mjs scripts/user-data.test.mjs`（临时副本、临时 HOME、假浏览器和随机本机端口，不操作用户浏览器与真实用户数据）
+- 回归验证 → `node --test scripts/check-deps.test.mjs scripts/cdp-connection.test.mjs scripts/cdp-proxy.test.mjs scripts/proxy-maintenance.test.mjs scripts/browser-discovery.test.mjs scripts/browser-probe.test.mjs scripts/page-frames.test.mjs scripts/user-data.test.mjs`（临时副本、临时 HOME、假浏览器和随机本机端口，不操作用户浏览器与真实用户数据）
 
 不维护浏览器名单、不扫描目录或固定端口：日常只读所配置数据目录的 `DevToolsActivePort`，不可用即硬错；首次配置只列根目录的文件夹名，探测范围由代码限定在应用数据根目录内（拒绝 ~、.. 越界、外部绝对路径与软链接逃逸），且无论找到几个都询问用户。配置值无效（不是含 Local State 的数据目录）时先报配置错误，与共享服务是否在运行无关。
 

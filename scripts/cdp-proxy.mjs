@@ -11,6 +11,7 @@ import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { createCdpConnection } from './cdp-connection.mjs';
 import { selectBrowser, explainUnavailable } from './browser-discovery.mjs';
+import { createPageFrames, FrameError } from './page-frames.mjs';
 
 // --- 解析命令行 --browser 参数（本次启动用哪个浏览器）---
 function parseBrowserArg() {
@@ -122,6 +123,14 @@ const connection = createCdpConnection({
       const { sessionId, targetInfo } = msg.params;
       sessions.set(targetInfo.targetId, sessionId);
     }
+    // 标签页关闭、跨进程 iframe 换进程或被移除时，浏览器解除对应 session；从缓存删除，下次使用时重新 attach。
+    if (msg.method === 'Target.detachedFromTarget') {
+      const { sessionId, targetId } = msg.params;
+      for (const [id, sid] of sessions) {
+        if (sid === sessionId && (!targetId || id === targetId)) sessions.delete(id);
+      }
+      portGuardedSessions.delete(sessionId);
+    }
     if (msg.method === 'Fetch.requestPaused') {
       const { requestId, sessionId: sid } = msg.params;
       sendCDP('Fetch.failRequest', { requestId, errorReason: 'ConnectionRefused' }, sid)
@@ -148,6 +157,9 @@ async function ensureSession(targetId) {
   }
   throw new Error('attach 失败: ' + JSON.stringify(resp.error));
 }
+
+// 页面中的 iframe（列举、执行、坐标点击路由）；跨进程 iframe 的子 session 同样经 ensureSession 进入缓存
+const pageFrames = createPageFrames({ send: (...args) => sendCDP(...args), ensureSession });
 
 // 拦截页面对 Chrome 调试端口的探测（反风控）
 // 只拦截 127.0.0.1:{chromePort} 的请求，不影响其他任何本地服务
@@ -388,16 +400,32 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ ok: true }));
     }
 
-    // POST /eval?target=xxx - 执行 JS
+    // GET /frames?target=xxx - 列出页面主文档中的 iframe（frameId、网址、是否跨进程与定位线索）
+    else if (pathname === '/frames') {
+      if (!q.target) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: '需要 target' }));
+        return;
+      }
+      res.end(JSON.stringify(await pageFrames.listFrames(q.target), null, 2));
+    }
+
+    // POST /eval?target=xxx[&frame=frameId] - 执行 JS；带 frame 时在该 iframe 中执行（frameId 取自 /frames）
     else if (pathname === '/eval') {
-      const sid = await ensureSession(q.target);
+      let sid;
+      let contextId;
+      if (q.frame !== undefined) ({ sessionId: sid, contextId } = await pageFrames.frameContext(q.target, q.frame));
+      else sid = await ensureSession(q.target);
       const body = await readBody(req);
       const expr = body || q.expr || 'document.title';
       const resp = await sendCDP('Runtime.evaluate', {
         expression: expr,
         returnByValue: true,
         awaitPromise: true,
+        ...(contextId ? { contextId } : {}),
       }, sid);
+      // 不带 frame 时保持原有返回方式不变；带 frame 时如实报告 CDP 错误
+      if (contextId && resp.error) throw new Error('Runtime.evaluate: ' + resp.error.message);
       if (resp.result?.result?.value !== undefined) {
         res.end(JSON.stringify({ value: resp.result.result.value }));
       } else if (resp.result?.exceptionDetails) {
@@ -406,6 +434,31 @@ const server = http.createServer(async (req, res) => {
       } else {
         res.end(JSON.stringify(resp.result));
       }
+    }
+
+    // GET /clickXY?target=xxx&x=120&y=90 - 按视口坐标真实鼠标点击；命中跨进程 iframe 时换算坐标并发给其子 session，不激活标签页
+    else if (pathname === '/clickXY') {
+      const x = Number(q.x);
+      const y = Number(q.y);
+      if (!q.target || !q.x?.trim() || !q.y?.trim() || !Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: '需要 target，以及有限的非负 x、y 视口坐标' }));
+        return;
+      }
+      const route = await pageFrames.routePoint(q.target, x, y);
+      for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+        const resp = await sendCDP('Input.dispatchMouseEvent', {
+          type, x: route.x, y: route.y,
+          button: type === 'mouseMoved' ? 'none' : 'left',
+          buttons: type === 'mousePressed' ? 1 : 0,
+          clickCount: type === 'mouseMoved' ? 0 : 1,
+        }, route.sessionId);
+        if (resp.error) throw new Error('Input.dispatchMouseEvent: ' + resp.error.message);
+      }
+      res.end(JSON.stringify({
+        clicked: true, x, y,
+        ...(route.frameId ? { frameId: route.frameId, crossProcess: route.crossProcess } : {}),
+      }));
     }
 
     // POST /click?target=xxx - 点击（body 为 CSS 选择器）
@@ -574,15 +627,19 @@ const server = http.createServer(async (req, res) => {
           '/navigate?target=': 'POST body=URL - 导航（自动等待加载）',
           '/back?target=': 'GET - 后退',
           '/info?target=': 'GET - 页面标题/URL/状态',
-          '/eval?target=': 'POST body=JS表达式 - 执行 JS',
+          '/frames?target=': 'GET - 列出页面中的 iframe（frameId、网址、是否跨进程）',
+          '/eval?target=&frame=': 'POST body=JS表达式 - 执行 JS（frame 可选，取自 /frames）',
           '/click?target=': 'POST body=CSS选择器 - 点击元素',
+          '/clickAt?target=': 'POST body=CSS选择器 - 真实鼠标点击',
+          '/clickXY?target=&x=&y=': 'GET - 按视口坐标真实鼠标点击（可点中跨进程 iframe）',
+          '/setFiles?target=': 'POST body=JSON - 设置文件输入',
           '/scroll?target=&y=&direction=': 'GET - 滚动页面',
           '/screenshot?target=&file=': 'GET - 截图',
         },
       }));
     }
   } catch (e) {
-    res.statusCode = 500;
+    res.statusCode = e instanceof FrameError ? 400 : 500;
     res.end(JSON.stringify({ error: e.message }));
   } finally {
     // 客户端断开不会取消浏览器动作；以 handler 完成结算，避免维护误停后台操作。
