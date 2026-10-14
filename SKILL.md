@@ -26,10 +26,16 @@ node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 
 按脚本输出处理：
 - `exit 0` → 直接调用 Proxy API，不再手动启动或重启 Proxy
-- `exit 2` → 需询问用户偏好，写入 `~/.web-access/config.env` 的 `WEB_ACCESS_BROWSER`（实际路径见脚本输出）
+- `exit 2` → 尚未设置浏览器，进入首次配置（见下）
 - `exit 1` → 按 stdout 错误信息处理。若提示包含「Agent 处理顺序」，按其步骤执行（如先用系统命令打开浏览器后重跑），自动可解则不打扰用户；仍失败再向用户求助
 
-支持参数 `--browser <chrome|edge>` 表达本次临时覆盖（不写 config.env）。
+**浏览器 = 它的用户数据目录。** `~/.web-access/config.env` 的 `WEB_ACCESS_BROWSER` 存数据目录路径（如 `~/Library/Application Support/Dia/User Data`），任何 Chromium 内核浏览器都可以；旧值 `chrome` / `chrome-canary` / `chromium` / `edge` 仍有效，按平台对应到标准目录。日常运行只读该目录里的 `DevToolsActivePort`，连不上就报错，不换浏览器、不猜端口。`--browser <数据目录路径>` 表达本次临时覆盖（不写 config.env）。
+
+**首次配置（exit 2）**：脚本列出应用数据根目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`）的最外层文件夹名，不进入任何文件夹。
+1. 从文件夹名认出 Chromium 内核浏览器（Google、Microsoft Edge、BraveSoftware、Arc、Dia、Vivaldi、com.operasoftware.Opera 等）
+2. 只探测认出的文件夹：`node "${CLAUDE_SKILL_DIR}/scripts/browser-probe.mjs" Google Dia`。它在文件夹内向下最多 3 层找含 `Local State` 的数据目录，报告路径、显示名和远程调试是否已开启（只看端口文件并做 TCP 探测，不读浏览器数据、不触发授权）
+3. 把结果告诉用户并询问用哪个——即使只找到一个也要问；用户选定后写入 `WEB_ACCESS_BROWSER=<数据目录路径>`
+4. 远程调试未开启时，请用户在该浏览器地址栏打开 `chrome://inspect/#remote-debugging`（Edge 为 `edge://inspect/#remote-debugging`），勾选 "Allow remote debugging for this browser instance"，再重跑前置检查
 
 若调试端口文件不可读，脚本会报告 `EPERM/EACCES`，不要当成浏览器未开启调试。可在 `config.env` 将已核对的 `WEB_ACCESS_CDP_PORT` 明确绑定到 `WEB_ACCESS_BROWSER`；端口归属由配置提供，不自动猜测。留空仍使用文件发现，另一浏览器的 `--browser` 不借用此端口。
 
@@ -42,7 +48,7 @@ node "${CLAUDE_SKILL_DIR}/scripts/proxy-maintenance.mjs" status
 node "${CLAUDE_SKILL_DIR}/scripts/proxy-maintenance.mjs" restart
 ```
 
-维护命令按实例身份停止服务；有执行中的请求、未完成的 CDP 命令、Agent 标签页或连接正在建立时会拒绝停止，等任务清理完再运行。切换浏览器时先执行 `proxy-maintenance.mjs stop`，成功后再运行 `check-deps.mjs --browser <id>`。旧版本没有维护接口时，命令会提示一次性迁移，不自动强杀。退出码与状态字段见 [API 参考](references/cdp-api.md)。
+维护命令按实例身份停止服务；有执行中的请求、未完成的 CDP 命令、Agent 标签页或连接正在建立时会拒绝停止，等任务清理完再运行。切换浏览器时先执行 `proxy-maintenance.mjs stop`，成功后再运行 `check-deps.mjs --browser <数据目录路径>`（或改写 config.env 后运行）。旧版本没有维护接口时，命令会提示一次性迁移，不自动强杀。退出码与状态字段见 [API 参考](references/cdp-api.md)。
 
 检查通过后并必须在回复中向用户直接展示以下须知，再执行站点操作：
 
@@ -119,7 +125,7 @@ node "${CLAUDE_SKILL_DIR}/scripts/find-url.mjs" [关键词...] [--only bookmarks
 
 ## 浏览器 CDP 模式
 
-通过 CDP Proxy 直连用户日常浏览器（Chrome / Edge / Chromium 等 Chromium 系），天然携带登录态，无需启动独立浏览器。
+通过 CDP Proxy 直连用户日常浏览器（Chrome、Edge、Brave、Arc、Dia 等任意 Chromium 内核浏览器），天然携带登录态，无需启动独立浏览器。
 若无用户明确要求，不主动操作用户已有 tab，所有操作都在自己创建的后台 tab 中进行，保持对用户环境的最小侵入。不关闭用户 tab 的前提下，完成任务后关闭自己创建的 tab，保持环境整洁。
 
 ### 启动

@@ -1,16 +1,19 @@
 # Web Access
 
-通过本机 Chrome / Edge 的 CDP 连接完成浏览器任务，Node.js 22+，无需独立自动化浏览器。
+通过本机日常浏览器（任意 Chromium 内核，按用户数据目录选定）的 CDP 连接完成浏览器任务，Node.js 22+，无需独立自动化浏览器。
 
 - 使用流程与浏览行为 → `SKILL.md`
 - 环境检查、已有服务复用与后台启动 → `scripts/check-deps.mjs`
-- 浏览器偏好和端口发现 → `scripts/browser-discovery.mjs`
+- 浏览器身份（数据目录路径，旧值 chrome / edge 等按平台映射）、偏好与端口发现 → `scripts/browser-discovery.mjs`
+- 首次配置：列应用数据根目录的最外层文件夹名、在指定文件夹内探测数据目录 → `scripts/browser-probe.mjs`
 - 用户数据位置（`~/.web-access/`）与旧版本数据一次性迁移 → `scripts/user-data.mjs`
 - HTTP API、标签页生命周期和服务维护门 → `scripts/cdp-proxy.mjs`
 - 唯一 CDP 连接所有者、并发握手、命令结算 → `scripts/cdp-connection.mjs`
 - 跨平台集中维护 → `scripts/proxy-maintenance.mjs`
 - API 契约 → `references/cdp-api.md`
-- 回归验证 → `node --test scripts/check-deps.test.mjs scripts/cdp-connection.test.mjs scripts/cdp-proxy.test.mjs scripts/proxy-maintenance.test.mjs scripts/browser-discovery.test.mjs scripts/user-data.test.mjs`（临时副本、临时 HOME、假浏览器和随机本机端口，不操作用户浏览器与真实用户数据）
+- 回归验证 → `node --test scripts/check-deps.test.mjs scripts/cdp-connection.test.mjs scripts/cdp-proxy.test.mjs scripts/proxy-maintenance.test.mjs scripts/browser-discovery.test.mjs scripts/browser-probe.test.mjs scripts/user-data.test.mjs`（临时副本、临时 HOME、假浏览器和随机本机端口，不操作用户浏览器与真实用户数据）
+
+不维护浏览器名单、不扫描目录或固定端口：日常只读所配置数据目录的 `DevToolsActivePort`，不可用即硬错；首次配置只列根目录的文件夹名，探测只进入 Agent 指定的文件夹，且无论找到几个都询问用户。
 
 Proxy 没有时长或空闲退出计时器；健康的已有连接直接复用，断线由原服务重新连接。不要为前置检查或任务结束停止已有服务。15 分钟自动清理仅作用于 Agent 创建的闲置标签页。浏览器授权由浏览器控制。
 

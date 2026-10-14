@@ -117,15 +117,15 @@ git clone https://github.com/eze-is/web-access ~/.claude/skills/web-access
 ```
 
 > [!IMPORTANT]
-> **升级说明（给 Agent 和用户）**
+> **v2.6 升级说明（给 Agent 和用户）**：完整说明与 Agent 自检步骤见 [references/migration-2.6.md](references/migration-2.6.md)。
 >
-> 从本版本起，用户数据（浏览器偏好 `config.env`、站点经验 `site-patterns/`）存放在用户目录下的 `~/.web-access/`（Windows 为 `%USERPROFILE%\.web-access\`），不再放在 skill 目录内。
+> 1. **用户数据移出 skill 目录**：浏览器偏好 `config.env`、站点经验 `site-patterns/` 改放在用户目录下的 `~/.web-access/`（Windows 为 `%USERPROFILE%\.web-access\`），此后任何方式升级都不会再丢。
+>    - **用 `npx skills` 从旧版本升级**：`npx skills update` 会先删除整个 skill 目录再重装，旧数据会随之丢失。**升级前**先运行下面的命令备份，再执行升级。
+>    - **git clone 或 Claude Code 插件安装**：升级后首次运行前置检查时自动复制旧数据（只复制、不删除、不覆盖已有文件），并输出一行 `user-data:` 说明。
+> 2. **浏览器配置改为数据目录路径**：任何 Chromium 内核浏览器（Brave、Arc、Dia、Vivaldi……）都能用；旧值 `chrome` / `edge` 等继续有效，老配置不用改。
+> 3. **升级后重启一次共享服务**：`node "<skill路径>/scripts/proxy-maintenance.mjs" restart`，会保留原来的浏览器选择。
 >
-> - **用 `npx skills` 从旧版本升级**：`npx skills update` 会先删除整个 skill 目录再重装，旧版本的数据会随之丢失。**升级前**先把旧 skill 目录下的 `config.env` 和 `references/site-patterns/` 复制到 `~/.web-access/`，再执行升级。
-> - **git clone 或 Claude Code 插件安装**：升级后首次运行前置检查时自动复制旧数据（只复制、不删除、不覆盖已有文件），并输出一行 `user-data:` 说明，无需手动操作。
-> - 本版本之后，任何方式升级都不会再丢失这些数据。
->
-> macOS / Linux（`SKILL_DIR` 换成旧版本 skill 的实际目录，如 `~/.claude/skills/web-access`、`~/.agents/skills/web-access`）：
+> macOS / Linux 升级前备份（`SKILL_DIR` 换成旧版本 skill 的实际目录，如 `~/.claude/skills/web-access`、`~/.agents/skills/web-access`）：
 >
 > ```bash
 > SKILL_DIR=~/.claude/skills/web-access
@@ -145,38 +145,41 @@ git clone https://github.com/eze-is/web-access ~/.claude/skills/web-access
 
 ## 前置配置（CDP 模式）
 
-CDP 模式需要 **Node.js 22+** 和浏览器（Chrome / Edge）开启远程调试：
+CDP 模式需要 **Node.js 22+** 和一个开启了远程调试的 Chromium 内核浏览器（Chrome、Edge、Brave、Arc、Dia、Vivaldi 等）：
 
-1. 在你想用的浏览器地址栏打开对应 inspect 页面：
-   - Chrome：`chrome://inspect/#remote-debugging`
-   - Edge：`edge://inspect/#remote-debugging`
+1. 在你想用的浏览器地址栏打开 `chrome://inspect/#remote-debugging`（Edge 为 `edge://inspect/#remote-debugging`）
 2. 勾选 **Allow remote debugging for this browser instance**（可能需要重启浏览器）
 
-### 浏览器偏好（config.env）
+web-access 的设计是让 Agent 与你共用日常浏览器和登录态。用 `--remote-debugging-port` 单独启动的调试浏览器不在支持范围内，脚本也不会自动扫描 9222 等固定端口。
 
-skill 长期偏好保存在 `~/.web-access/config.env`（Windows 为 `%USERPROFILE%\.web-access\config.env`；首次运行自动从 `templates/config.env.template` 创建）。它与站点经验 `~/.web-access/site-patterns/` 一起放在 skill 目录之外，升级 skill 不会覆盖或删除：
+### 浏览器配置（config.env）
+
+skill 长期偏好保存在 `~/.web-access/config.env`（Windows 为 `%USERPROFILE%\.web-access\config.env`；首次运行自动从 `templates/config.env.template` 创建）。它与站点经验 `~/.web-access/site-patterns/` 一起放在 skill 目录之外，升级 skill 不会覆盖或删除。
+
+`WEB_ACCESS_BROWSER` 填浏览器的**用户数据目录**（浏览器把调试端口文件 `DevToolsActivePort` 写在这里）：
 
 ```bash
-# 留空 = 每次启动都询问偏好；设值 = 固定使用该浏览器
-WEB_ACCESS_BROWSER=edge
+WEB_ACCESS_BROWSER=~/Library/Application Support/Dia/User Data
+# Windows 例：%LOCALAPPDATA%\Google\Chrome\User Data；Linux 例：~/.config/google-chrome
+# 旧值 chrome / chrome-canary / chromium / edge 仍可用，按平台对应到标准目录
 ```
 
-如果系统拒绝读取 `DevToolsActivePort`，或使用固定调试端口，可在同一配置中设置可选的 `WEB_ACCESS_CDP_PORT`。它必须与 `WEB_ACCESS_BROWSER` 配对，填入已核对属于该浏览器的端口；留空使用自动发现。TCP 可达只表示端口在监听，浏览器归属由这份明确配置提供。指定其他浏览器时不会借用此端口，端口失效也不自动降级。
+一般不用手填：留空时 Agent 运行前置检查会进入首次配置——列出应用数据目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`）里的文件夹名，从中认出浏览器，用 `scripts/browser-probe.mjs` 只在认出的文件夹里确认数据目录和远程调试状态，问你用哪个后写入。日常运行只读所配置目录里的端口文件；连不上就报错并给出处理步骤，不会换到别的浏览器，也不会扫描固定端口。
 
-合法值：`chrome` / `edge`
+如果系统拒绝读取 `DevToolsActivePort`，可在同一配置中设置可选的 `WEB_ACCESS_CDP_PORT`。它必须与 `WEB_ACCESS_BROWSER` 配对，填入已核对属于该浏览器的端口；留空使用自动发现。TCP 可达只表示端口在监听，浏览器归属由这份明确配置提供。指定其他浏览器时不会借用此端口，端口失效也不自动降级。
 
-**临时用别的浏览器**（不修改 config.env）：
+**临时用别的浏览器**（不修改 config.env，取值规则同上）：
 
 ```bash
-node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs" --browser chrome
+node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs" --browser "$HOME/Library/Application Support/Google/Chrome"
 ```
 
 **切换浏览器**（proxy 已连接旧的）：
 
 ```bash
 node "${CLAUDE_SKILL_DIR}/scripts/proxy-maintenance.mjs" stop
-# 确认停止成功后，再启动指定浏览器
-node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs" --browser chrome
+# 确认停止成功后，改写 config.env，或本次指定
+node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs" --browser edge
 ```
 
 环境检查（Agent 运行时会自动完成前置检查，无需手动执行）：
