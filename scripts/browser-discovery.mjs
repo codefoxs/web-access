@@ -157,13 +157,3 @@ export async function selectBrowser(override = null) {
   }
   return { kind: 'ambiguous', ...facts };
 }
-
-// 兜底：扫描常用固定端口
-// 适用场景：用户手动 --remote-debugging-port=9222 启动浏览器，
-// 此时 DevToolsActivePort 可能不在默认 user-data-dir。
-export async function findFallbackPort() {
-  for (const port of [9222, 9229, 9333]) {
-    if (await checkPort(port)) return port;
-  }
-  return null;
-}

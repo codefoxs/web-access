@@ -10,7 +10,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { createCdpConnection } from './cdp-connection.mjs';
-import { selectBrowser, findFallbackPort } from './browser-discovery.mjs';
+import { selectBrowser } from './browser-discovery.mjs';
 import { userDataPaths } from './user-data.mjs';
 
 // --- 解析命令行 --browser 参数（本次启动用哪个浏览器）---
@@ -111,14 +111,8 @@ async function discoverChromePort() {
       `若想换成其他浏览器，请等共享任务完成，通过 proxy-maintenance.mjs stop 停止后再指定 --browser。`
     );
   }
-  // 仅在「从未成功连接 + 无偏好/override」时允许固定端口兜底（手动 --remote-debugging-port 启动场景）
-  const fallbackPort = await findFallbackPort();
-  if (fallbackPort !== null) {
-    connectedBrowser = { id: 'unknown', label: '未知（通过手动调试端口连接）', source: 'fallback' };
-    console.log(`[CDP Proxy] 通过手动调试端口连接: ${fallbackPort}`);
-    return { port: fallbackPort, wsPath: null };
-  }
-  return null;
+  // 没有偏好也没有 override：不扫描 9222 等固定端口，由前置检查询问用户。
+  throw new Error('尚未选定浏览器。请先运行 node scripts/check-deps.mjs，按提示设置 WEB_ACCESS_BROWSER，或启动时指定 --browser。');
 }
 
 function getWebSocketUrl(port, wsPath) {
@@ -132,7 +126,6 @@ const connection = createCdpConnection({
   WebSocketImpl: WS,
   discoverUrl: async () => {
     const discovered = await discoverChromePort();
-    if (!discovered) throw new Error('未发现可用浏览器，请检查远程调试设置');
     chromePort = discovered.port;
     return getWebSocketUrl(discovered.port, discovered.wsPath);
   },

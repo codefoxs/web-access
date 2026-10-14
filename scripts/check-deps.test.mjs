@@ -41,10 +41,6 @@ export async function selectBrowser(override) {
   const id = override || getConfiguredBrowserId() || 'chrome';
   return { kind: 'ok', browser: { id, label: id, port: 9222 }, source: override ? 'override' : 'preference' };
 }
-export async function findFallbackPort() {
-  record({ action: 'findFallbackPort' });
-  return null;
-}
 `);
   await fs.writeFile(path.join(scripts, 'cdp-proxy.mjs'), `
 import fs from 'node:fs';

@@ -35,7 +35,6 @@ export async function selectBrowser() {
   if (process.env.TEST_HOLD_DISCOVERY === '1') await waitBarrier('discovery');
   return { kind: 'ok', browser: { id: 'chrome', label: 'Fake Chrome', port: 9222, wsPath: '/fake-browser' }, source: 'preference' };
 }
-export async function findFallbackPort() { throw new Error('Unexpected fallback discovery'); }
 `;
 const PRELOAD = `
 import fs from 'node:fs';

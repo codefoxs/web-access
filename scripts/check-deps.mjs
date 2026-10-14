@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { selectBrowser, knownBrowsers, findFallbackPort, getConfiguredBrowserId } from './browser-discovery.mjs';
+import { selectBrowser, knownBrowsers, getConfiguredBrowserId } from './browser-discovery.mjs';
 import { userDataPaths, migrateLegacyData } from './user-data.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -223,12 +223,7 @@ async function resolveAndReport(override) {
         console.log(`  请允许当前工具读取调试端口文件，或在 ${CONFIG_PATH} 明确配置 WEB_ACCESS_BROWSER 与已核对的 WEB_ACCESS_CDP_PORT`);
         return { proceed: false, exitCode: 1 };
       }
-      // 末路兜底：尝试常见固定端口（用户手动 --remote-debugging-port=9222 启动的场景）
-      const fallbackPort = await findFallbackPort();
-      if (fallbackPort) {
-        console.log(`browser: ok (port ${fallbackPort}) [通过手动调试端口连接]`);
-        return { proceed: true };
-      }
+      // 不扫描 9222 等固定端口：独立调试浏览器不在支持范围，避免连上用户未选择的浏览器。
       console.log('browser: 未连接 — 没有任何浏览器打开远程调试开关');
       console.log(`  支持的浏览器：${knownBrowsers().map(b => b.label).join('、')}`);
       console.log('  在你想用的浏览器地址栏打开 chrome://inspect/#remote-debugging 或 edge://inspect/#remote-debugging，勾选 "Allow remote debugging for this browser instance"');
