@@ -13,7 +13,7 @@
 - API 契约 → `references/cdp-api.md`
 - 回归验证 → `node --test scripts/check-deps.test.mjs scripts/cdp-connection.test.mjs scripts/cdp-proxy.test.mjs scripts/proxy-maintenance.test.mjs scripts/browser-discovery.test.mjs scripts/browser-probe.test.mjs scripts/user-data.test.mjs`（临时副本、临时 HOME、假浏览器和随机本机端口，不操作用户浏览器与真实用户数据）
 
-不维护浏览器名单、不扫描目录或固定端口：日常只读所配置数据目录的 `DevToolsActivePort`，不可用即硬错；首次配置只列根目录的文件夹名，探测只进入 Agent 指定的文件夹，且无论找到几个都询问用户。
+不维护浏览器名单、不扫描目录或固定端口：日常只读所配置数据目录的 `DevToolsActivePort`，不可用即硬错；首次配置只列根目录的文件夹名，探测范围由代码限定在应用数据根目录内（拒绝 ~、.. 越界、外部绝对路径与软链接逃逸），且无论找到几个都询问用户。配置值无效（不是含 Local State 的数据目录）时先报配置错误，与共享服务是否在运行无关。
 
 Proxy 没有时长或空闲退出计时器；健康的已有连接直接复用，断线由原服务重新连接。不要为前置检查或任务结束停止已有服务。15 分钟自动清理仅作用于 Agent 创建的闲置标签页。浏览器授权由浏览器控制。
 

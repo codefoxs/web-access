@@ -26,18 +26,14 @@ node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 
 按脚本输出处理：
 - `exit 0` → 直接调用 Proxy API，不再手动启动或重启 Proxy
-- `exit 2` → 尚未设置浏览器，进入首次配置（见下）
-- `exit 1` → 按 stdout 错误信息处理。若提示包含「Agent 处理顺序」，按其步骤执行（如先用系统命令打开浏览器后重跑），自动可解则不打扰用户；仍失败再向用户求助
+- `exit 2` → 尚未设置浏览器、也没有可复用的共享服务，进入首次配置（见下）
+- `exit 1` → 按 stdout 错误信息处理。若提示包含「Agent 处理顺序」，按其步骤执行（如先用系统命令打开浏览器后重跑），自动可解则不打扰用户；仍失败再向用户求助。「配置错误」只需改正配置，不要为此停止或重启共享服务
 
-**浏览器 = 它的用户数据目录。** `~/.web-access/config.env` 的 `WEB_ACCESS_BROWSER` 存数据目录路径（如 `~/Library/Application Support/Dia/User Data`），任何 Chromium 内核浏览器都可以；旧值 `chrome` / `chrome-canary` / `chromium` / `edge` 仍有效，按平台对应到标准目录。日常运行只读该目录里的 `DevToolsActivePort`，连不上就报错，不换浏览器、不猜端口。`--browser <数据目录路径>` 表达本次临时覆盖（不写 config.env）。
+**浏览器 = 它的用户数据目录。** `~/.web-access/config.env` 的 `WEB_ACCESS_BROWSER` 存数据目录路径，即含 `Local State` 的那一层（如 `~/Library/Application Support/Dia/User Data`），任何 Chromium 内核浏览器都可以；旧值 `chrome` / `chrome-canary` / `chromium` / `edge` 仍有效，按平台对应到标准目录。日常运行只读该目录里的 `DevToolsActivePort`，连不上就报错，不换浏览器、不猜端口。`--browser <数据目录路径>` 表达本次临时覆盖（不写 config.env）。
 
-**首次配置（exit 2）**：脚本列出应用数据根目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`）的最外层文件夹名，不进入任何文件夹。
-1. 从文件夹名认出 Chromium 内核浏览器（Google、Microsoft Edge、BraveSoftware、Arc、Dia、Vivaldi、com.operasoftware.Opera 等）
-2. 只探测认出的文件夹：`node "${CLAUDE_SKILL_DIR}/scripts/browser-probe.mjs" Google Dia`。它在文件夹内向下最多 3 层找含 `Local State` 的数据目录，报告路径、显示名和远程调试是否已开启（只看端口文件并做 TCP 探测，不读浏览器数据、不触发授权）
-3. 把结果告诉用户并询问用哪个——即使只找到一个也要问；用户选定后写入 `WEB_ACCESS_BROWSER=<数据目录路径>`
-4. 远程调试未开启时，请用户在该浏览器地址栏打开 `chrome://inspect/#remote-debugging`（Edge 为 `edge://inspect/#remote-debugging`），勾选 "Allow remote debugging for this browser instance"，再重跑前置检查
+**首次配置**：按 `exit 2` 的输出逐步做，步骤以脚本输出为准。要点：脚本只列出应用数据根目录的最外层文件夹名；由你从名字认出浏览器，再用 `browser-probe.mjs` 探测（它只接受根目录下的相对路径）；无论找到几个都要问用户，再把选定的数据目录写入配置。已有健康的共享服务时，前置检查优先复用它，不会进入首次配置。
 
-若调试端口文件不可读，脚本会报告 `EPERM/EACCES`，不要当成浏览器未开启调试。可在 `config.env` 将已核对的 `WEB_ACCESS_CDP_PORT` 明确绑定到 `WEB_ACCESS_BROWSER`；端口归属由配置提供，不自动猜测。留空仍使用文件发现，另一浏览器的 `--browser` 不借用此端口。
+若调试端口文件不可读，脚本会报告 `EPERM/EACCES`，不要当成浏览器未开启调试。可在 `config.env` 用 `WEB_ACCESS_CDP_PORT` 为日常浏览器显式指定已核对的端口；端口归属由配置提供，不自动猜测，另一浏览器的 `--browser` 不借用此端口。
 
 用户数据（`config.env` 与站点经验）位于用户目录下的 `~/.web-access/`（Windows 为 `%USERPROFILE%\.web-access\`），不在 skill 目录内，升级 skill 不受影响。旧版本存放在 skill 目录内的数据，由前置检查首次运行时自动复制过来，并输出一行 `user-data:` 说明。
 
@@ -109,6 +105,8 @@ node "${CLAUDE_SKILL_DIR}/scripts/proxy-maintenance.mjs" restart
 ```bash
 node "${CLAUDE_SKILL_DIR}/scripts/find-url.mjs" [关键词...] [--only bookmarks|history] [--browser chrome|edge] [--limit N] [--since 1d|7h|YYYY-MM-DD] [--sort recent|visits]
 ```
+
+（此处 `--browser` 是浏览器名，只支持 Chrome / Edge，与 check-deps 的数据目录写法不同。）
 
 关键词空格分词、多词 AND，匹配 title + url（可省略）；默认遍历所有已安装的 Chromium 系浏览器（Chrome、Edge），`--browser` 限定单一来源；`--since` / `--sort` 仅作用于历史；默认按最近访问倒序，`--sort visits` 按访问次数排序（适合"高频访问的网站"这类场景）。
 

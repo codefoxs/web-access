@@ -4,7 +4,7 @@
 
 1. 用户数据（`config.env`、站点经验 `site-patterns/`）从 Skill 目录移到 `~/.web-access/`（Windows `%USERPROFILE%\.web-access\`）。**用 `npx skills update` 升级的，升级前先备份**，见下文第 1 节。
 2. `WEB_ACCESS_BROWSER` 改存浏览器的**用户数据目录路径**，任何 Chromium 内核浏览器都能用；旧值 `chrome` / `chrome-canary` / `chromium` / `edge` 继续有效，**老配置不用改**。
-3. 不再自动扫描 9222 / 9229 / 9333 等固定端口；没有设置浏览器时进入首次配置，不会自动连上任何浏览器。
+3. 不再自动扫描 9222 / 9229 / 9333 等固定端口。没有设置浏览器时：若已有健康的共享服务在运行，前置检查照常复用它；没有可复用的服务时才进入首次配置，不会自动连上任何浏览器。
 4. 升级后集中重启一次共享服务：`node "<skill路径>/scripts/proxy-maintenance.mjs" restart`。
 
 ## 1. 用户数据位置
@@ -59,16 +59,17 @@ WEB_ACCESS_BROWSER=chrome
 
 - 日常运行只读所配置目录的 `DevToolsActivePort` 并做 TCP 探测；连不上就报错，不换浏览器、不猜端口。
 - `--browser` 的取值规则相同（路径或旧值），只对本次有效，不写配置。
-- `WEB_ACCESS_CDP_PORT` 不变：仍只绑定 `WEB_ACCESS_BROWSER` 所指的浏览器，用于端口文件不可读的情况。
+- `WEB_ACCESS_CDP_PORT` 不变：仍只绑定 `WEB_ACCESS_BROWSER` 所指的浏览器，只用于日常浏览器的端口文件读不到的情况。
+- 值必须是含 `Local State` 的数据目录；写成文件夹名、相对路径或不存在的目录时，前置检查报「配置错误」，与共享服务是否在运行无关，改正配置即可，不需要停止服务。
 - 显示名取路径里的文件夹名（`Dia/User Data` → Dia，`Google/Chrome` → Chrome），只用于提示。
 - 升级前已在运行的服务报告的是旧值（如 `chrome`）；前置检查和维护命令把它与对应的标准路径视为同一个浏览器，不会误报「浏览器不一致」。
 
 ## 3. 首次配置
 
-`WEB_ACCESS_BROWSER` 为空时，前置检查以 `exit 2` 结束，并输出应用数据根目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`）的最外层文件夹名，不进入任何文件夹。Agent 接着：
+`WEB_ACCESS_BROWSER` 为空、且没有可复用的共享服务时，前置检查以 `exit 2` 结束，并输出应用数据根目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`）的最外层文件夹名，不进入任何文件夹。Agent 接着：
 
 1. 从文件夹名认出 Chromium 内核浏览器
-2. 只探测认出的文件夹：`node "<skill路径>/scripts/browser-probe.mjs" <文件夹名> [更多文件夹名]`
+2. 只探测认出的文件夹：`node "<skill路径>/scripts/browser-probe.mjs" <文件夹名> [更多文件夹名]`（只接受应用数据根目录下的相对路径）
 3. 告诉用户找到了哪些、远程调试是否已开启，问用户用哪个（即使只有一个也要问），把选定的数据目录写进 `~/.web-access/config.env`
 4. 未开启的，请用户在该浏览器地址栏打开 `chrome://inspect/#remote-debugging`（Edge 为 `edge://inspect/#remote-debugging`）勾选 "Allow remote debugging for this browser instance"
 
@@ -82,11 +83,13 @@ WEB_ACCESS_BROWSER=chrome
 node "<skill路径>/scripts/proxy-maintenance.mjs" restart
 ```
 
-`restart` 保留原来的浏览器选择，新服务连上后输出 `"status":"ready"`（退出码 0）；输出 `waitingAuthorization`（退出码 3）表示浏览器授权还没确认。旧服务忙碌时会拒绝（退出码 2），稍后再试，不要用进程查杀命令。v2.5.4 及更早版本的服务没有维护接口，命令会提示一次性迁移、不自动强停。
+`restart` 保留原来的浏览器选择，新服务连上后输出 `"status":"ready"`（退出码 0）；输出 `waitingAuthorization`（退出码 3）表示浏览器授权还没确认。旧服务忙碌时会拒绝（退出码 2），稍后再试，不要用进程查杀命令。`/health` 里没有 `instanceId` 的旧服务没有维护接口，命令会提示一次性迁移、不自动强停。
 
 ## Agent 自检
 
 1. 运行前置检查。出现 `user-data:` 一行说明旧数据已复制，告诉用户一声即可。
-2. `exit 2`：按第 3 节完成首次配置。如果用户原来有偏好但数据丢了，也走这一步。
-3. `exit 1` 且提示浏览器不一致：说明共享服务还是升级前连接的另一个浏览器，等任务结束后按第 4 节重启。
-4. 不需要把旧值 `chrome` / `edge` 改写成路径；用户想换成 Arc、Dia、Brave 等其他浏览器时，再写入对应的数据目录路径。
+2. `exit 2`：按第 3 节完成首次配置。
+3. 用户原来的偏好随旧数据丢了、但旧的共享服务还在跑时，前置检查会继续复用它（`restart` 也会保留它的浏览器），不会提示首次配置。这时把 `proxy-maintenance.mjs status` 输出里的 `browser.id` 写回 `WEB_ACCESS_BROWSER`（`unknown` 表示旧版通过固定端口连上的浏览器，不在支持范围，应改为用户的日常浏览器）。
+4. `exit 1` 且提示浏览器不一致：说明共享服务还是升级前连接的另一个浏览器，等任务结束后按第 4 节重启。
+5. `exit 1` 且是「配置错误」：只改正配置，不要停止共享服务。
+6. 不需要把旧值 `chrome` / `edge` 改写成路径；用户想换成 Arc、Dia、Brave 等其他浏览器时，再写入对应的数据目录路径。

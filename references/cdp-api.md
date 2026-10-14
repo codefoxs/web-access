@@ -36,9 +36,9 @@ curl -s http://localhost:3456/health
 
 连接模块 `scripts/cdp-connection.mjs` 唯一拥有 socket、连接尝试和命令响应。`connect()` 从浏览器发现开始共享同一个 Promise；`send()` 只在已有连接发送，不隐式连接；`close()` 立即拒绝该连接的等待者。每个 socket 的事件只作用于它自己的连接上下文，失败会清空该连接的命令等待，后续请求可重试。模块同时支持原生 WebSocket（EventTarget）和 `ws`（EventEmitter）。服务端 HTTP 和标签页职责保留在 Proxy，浏览器选择保留在 discovery 模块。
 
-浏览器选择由 `scripts/browser-discovery.mjs` 负责：`WEB_ACCESS_BROWSER`（或 `--browser`）是浏览器用户数据目录路径，旧值 `chrome` / `chrome-canary` / `chromium` / `edge` 按平台映射到标准目录。只读该目录根部的 `DevToolsActivePort`，不可用即报错，不扫描其他目录或固定端口；未设置时 Proxy 拒绝连接，由前置检查引导首次配置（`scripts/browser-probe.mjs`）。
+浏览器选择由 `scripts/browser-discovery.mjs` 负责：`WEB_ACCESS_BROWSER`（或 `--browser`）是浏览器用户数据目录路径，旧值 `chrome` / `chrome-canary` / `chromium` / `edge` 按平台映射到标准目录。值必须指向含 `Local State` 的 Chromium 用户数据目录，否则为配置错误；目录存在时身份取真实路径（软链接、大小写差异归一）。只读该目录根部的 `DevToolsActivePort`，不可用即报错，不扫描其他目录或固定端口；未设置时 Proxy 拒绝连接，由前置检查引导首次配置（`scripts/browser-probe.mjs`）。
 
-`~/.web-access/config.env` 中可选的 `WEB_ACCESS_CDP_PORT` 明确绑定 `WEB_ACCESS_BROWSER`，用于端口文件受系统权限限制或固定端口的连接方式。留空使用文件发现，非空必须是十进制 `1..65535`，且 `WEB_ACCESS_BROWSER` 是有效的数据目录路径或旧值。显式映射须先核对浏览器归属；发现只检测 TCP，不建立授权握手。不同浏览器覆盖不借用此端口，离线也不回退。端口文件的 `EPERM/EACCES` 会作为权限事实报告，不能据此断言未开启调试。
+`~/.web-access/config.env` 中可选的 `WEB_ACCESS_CDP_PORT` 明确绑定 `WEB_ACCESS_BROWSER`，只用于日常浏览器的端口文件读不到（如系统权限拒绝读取）时显式指定端口；用 `--remote-debugging-port` 单独启动的调试浏览器不在支持范围内。留空使用文件发现，非空必须是十进制 `1..65535`，且 `WEB_ACCESS_BROWSER` 是有效的数据目录路径或旧值。显式映射须先核对浏览器归属；发现只检测 TCP，不建立授权握手。不同浏览器覆盖不借用此端口，离线也不回退。端口文件的 `EPERM/EACCES` 会作为权限事实报告，不能据此断言未开启调试。
 
 ### GET /targets
 列出所有已打开的页面 tab。返回数组，每项含 `targetId`、`title`、`url`。
@@ -133,7 +133,7 @@ curl -s "http://localhost:3456/screenshot?target=ID&file=/tmp/shot.png"
 |------|------|------|
 | `尚未设置浏览器` | `WEB_ACCESS_BROWSER` 为空 | 运行 `check-deps.mjs` 完成首次配置 |
 | `…的浏览器 <显示名>（<数据目录>）没连上` | 浏览器未运行、远程调试开关未开启或端口已失效 | 按错误里的「Agent 处理顺序」：先打开该浏览器；仍失败请用户在地址栏打开 `chrome://inspect/#remote-debugging`（Edge 为 `edge://inspect/#remote-debugging`）勾选 Allow |
-| `…的数据目录不存在` | 配置的路径写错 | 用 `browser-probe.mjs` 重新确认后改写配置 |
+| `配置错误 — WEB_ACCESS_BROWSER 的值无效` | 值不是绝对路径或旧值，目录不存在，或目录里没有 `Local State` | 改正配置（可用 `browser-probe.mjs` 确认路径）；不需要停止共享服务 |
 | `attach 失败` | targetId 无效或 tab 已关闭 | 用 `/targets` 获取最新列表 |
 | `CDP 命令超时` | 页面长时间未响应 | 重试或检查 tab 状态 |
 | 启动时端口被占用 | 另一个 Proxy 已在运行 | 新进程确认已有健康实例后直接退出，复用已有实例 |

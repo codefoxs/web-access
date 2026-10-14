@@ -156,7 +156,7 @@ web-access 的设计是让 Agent 与你共用日常浏览器和登录态。用 `
 
 skill 长期偏好保存在 `~/.web-access/config.env`（Windows 为 `%USERPROFILE%\.web-access\config.env`；首次运行自动从 `templates/config.env.template` 创建）。它与站点经验 `~/.web-access/site-patterns/` 一起放在 skill 目录之外，升级 skill 不会覆盖或删除。
 
-`WEB_ACCESS_BROWSER` 填浏览器的**用户数据目录**（浏览器把调试端口文件 `DevToolsActivePort` 写在这里）：
+`WEB_ACCESS_BROWSER` 填浏览器的**用户数据目录**，即含 `Local State` 的那一层（浏览器把调试端口文件 `DevToolsActivePort` 写在这里）：
 
 ```bash
 WEB_ACCESS_BROWSER=~/Library/Application Support/Dia/User Data
@@ -164,7 +164,7 @@ WEB_ACCESS_BROWSER=~/Library/Application Support/Dia/User Data
 # 旧值 chrome / chrome-canary / chromium / edge 仍可用，按平台对应到标准目录
 ```
 
-一般不用手填：留空时 Agent 运行前置检查会进入首次配置——列出应用数据目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`）里的文件夹名，从中认出浏览器，用 `scripts/browser-probe.mjs` 只在认出的文件夹里确认数据目录和远程调试状态，问你用哪个后写入。日常运行只读所配置目录里的端口文件；连不上就报错并给出处理步骤，不会换到别的浏览器，也不会扫描固定端口。
+一般不用手填：留空、且没有可复用的共享服务时，Agent 运行前置检查会进入首次配置——列出应用数据目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`）里的文件夹名，从中认出浏览器，用 `scripts/browser-probe.mjs` 只在认出的文件夹里确认数据目录和远程调试状态（探测范围由脚本限定在应用数据目录内），问你用哪个后写入。日常运行只读所配置目录里的端口文件；连不上就报错并给出处理步骤，不会换到别的浏览器，也不会扫描固定端口。
 
 如果系统拒绝读取 `DevToolsActivePort`，可在同一配置中设置可选的 `WEB_ACCESS_CDP_PORT`。它必须与 `WEB_ACCESS_BROWSER` 配对，填入已核对属于该浏览器的端口；留空使用自动发现。TCP 可达只表示端口在监听，浏览器归属由这份明确配置提供。指定其他浏览器时不会借用此端口，端口失效也不自动降级。
 
