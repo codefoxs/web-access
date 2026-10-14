@@ -59,7 +59,16 @@ function fakeBrowser({ hit = null, errors = {} } = {}) {
 }
 
 const methods = calls => calls.map(call => call.method);
-const releasedGroups = calls => calls.filter(call => call.method === 'Runtime.releaseObjectGroup').map(call => call.params.objectGroup);
+// 释放的对象组：返回前缀，并断言每个被释放的组都是本次调用创建临时对象时用的那个（组名唯一）
+const releasedGroups = calls => {
+  const created = new Set(calls.map(call => call.params?.objectGroup).filter(group => group && calls.some(c => c.method !== 'Runtime.releaseObjectGroup' && c.params?.objectGroup === group)));
+  const released = calls.filter(call => call.method === 'Runtime.releaseObjectGroup').map(call => call.params.objectGroup);
+  for (const group of released) {
+    assert.match(group, /^web-access-(frames|click)-[0-9a-f-]{36}$/);
+    assert.ok(created.size === 0 || created.has(group), `释放了未创建的组 ${group}`);
+  }
+  return released.map(group => group.replace(/-[0-9a-f-]{36}$/, ''));
+};
 
 test('listFrames 按文档顺序列出主文档 iframe：跨进程标记、当前网址与定位线索，用完释放临时对象', async () => {
   const { frames, calls, attached } = fakeBrowser();
@@ -156,4 +165,45 @@ test('CDP 错误带方法名抛出，临时对象组仍被释放', async () => {
   const { frames, calls } = fakeBrowser({ errors: { 'Runtime.getProperties': 'Object reference chain is too long' } });
   await assert.rejects(frames.listFrames('page-1'), /Runtime\.getProperties: Object reference chain is too long/);
   assert.deepEqual(releasedGroups(calls), ['web-access-frames']);
+});
+
+// 审查 F1：同一标签页上重叠的请求各自释放自己的对象组，互不影响。
+// 假浏览器按对象组登记远程对象，整组释放后再用其中的对象即报错（与 Chrome 一致），并在每个 CDP 调用上随机让出时间制造交错。
+test('同一标签页上重叠的 listFrames / routePoint 全部成功，不释放彼此的临时对象', async () => {
+  const groupOf = new Map();
+  let counter = 0;
+  const released = new Set();
+  const send = async (method, params = {}) => {
+    await new Promise(resolve => setTimeout(resolve, Math.random() * 4));
+    const alive = objectId => !released.has(groupOf.get(objectId));
+    const object = prefix => { const id = `${prefix}-${++counter}`; groupOf.set(id, params.objectGroup); return id; };
+    const dead = { error: { message: 'Could not find object with given id' } };
+    switch (method) {
+      case 'Runtime.releaseObjectGroup': released.add(params.objectGroup); return { result: {} };
+      case 'Runtime.evaluate':
+        if (params.expression.includes('querySelectorAll')) return { result: { result: { objectId: object('list') } } };
+        if (params.expression.includes('elementFromPoint')) return { result: { result: { objectId: object('hit') } } };
+        if (params.expression.includes('innerWidth')) return { result: { result: { value: [300, 250] } } };
+        return { result: { result: {} } };
+      case 'Runtime.getProperties': {
+        if (!alive(params.objectId)) return dead;
+        const group = groupOf.get(params.objectId);
+        const element = () => { const id = `el-${++counter}`; groupOf.set(id, group); return id; };
+        return { result: { result: [{ name: '0', value: { objectId: element() } }, { name: '1', value: { objectId: element() } }] } };
+      }
+      case 'DOM.describeNode':
+        return alive(params.objectId) ? { result: { node: { frameId: 'local-frame', attributes: [] } } } : dead;
+      case 'DOM.getBoxModel':
+        return alive(params.objectId) ? { result: { model: { content: [0, 0, 300, 0, 300, 250, 0, 250] } } } : dead;
+      case 'Target.getTargets': return { result: { targetInfos: [] } };
+      case 'Page.getFrameTree': return { result: { frameTree: { frame: { id: 'page-1' }, childFrames: [{ frame: { id: 'local-frame', url: 'http://localhost/a' } }] } } };
+      case 'Page.createIsolatedWorld': return { result: { executionContextId: 1 } };
+      case 'Page.captureScreenshot': return { result: { data: 'AA==' } };
+    }
+    return { result: {} };
+  };
+  const frames = createPageFrames({ send, ensureSession: async () => 'page-session' });
+  const results = await Promise.allSettled(Array.from({ length: 24 }, (_, i) => (i % 2 ? frames.listFrames('page-1') : frames.routePoint('page-1', 10, 10))));
+  const failures = results.filter(result => result.status === 'rejected').map(result => result.reason.message);
+  assert.deepEqual(failures, []);
 });

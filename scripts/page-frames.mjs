@@ -8,6 +8,8 @@
 //   - Page.createIsolatedWorld 用同一个名字重复调用返回同一个执行上下文，不会累积
 // 范围：只覆盖页面主文档里直接的 <iframe> / <frame>，不递归嵌套的 iframe。
 
+import { randomUUID } from 'node:crypto';
+
 // 调用方参数问题（frameId 格式不对、该页面没有这个 iframe），由调用方映射为 400
 export class FrameError extends Error {}
 
@@ -22,9 +24,11 @@ export function createPageFrames({ send, ensureSession }) {
     return resp.result;
   }
 
-  // 用对象组承载临时远程对象，结束后整组释放
-  async function withObjectGroup(sessionId, group, fn) {
-    try { return await fn(); }
+  // 用对象组承载临时远程对象，结束后整组释放。组名每次调用唯一：
+  // 同一标签页上重叠的请求共用 session，固定组名会让先结束的请求释放另一个请求还在用的对象。
+  async function withObjectGroup(sessionId, prefix, fn) {
+    const group = `${prefix}-${randomUUID()}`;
+    try { return await fn(group); }
     finally { await send('Runtime.releaseObjectGroup', { objectGroup: group }, sessionId).catch(() => {}); }
   }
 
@@ -37,8 +41,7 @@ export function createPageFrames({ send, ensureSession }) {
   // frameId 为 null 表示该 iframe 尚未加载出文档
   async function listFrames(targetId) {
     const sessionId = await ensureSession(targetId);
-    const group = 'web-access-frames';
-    return withObjectGroup(sessionId, group, async () => {
+    return withObjectGroup(sessionId, 'web-access-frames', async group => {
       const list = await call('Runtime.evaluate', {
         expression: "document.querySelectorAll('iframe, frame')", objectGroup: group,
       }, sessionId);
@@ -94,8 +97,7 @@ export function createPageFrames({ send, ensureSession }) {
   // 只沿实际命中的那一层 iframe 路由；命中空白或普通元素时照常发给页面。
   async function routePoint(targetId, x, y) {
     const sessionId = await ensureSession(targetId);
-    const group = 'web-access-click';
-    return withObjectGroup(sessionId, group, async () => {
+    return withObjectGroup(sessionId, 'web-access-click', async group => {
       const hit = await call('Runtime.evaluate', {
         expression: `document.elementFromPoint(${x}, ${y})`, objectGroup: group,
       }, sessionId);
