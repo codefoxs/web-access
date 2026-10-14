@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// CDP Proxy - 通过 HTTP API 操控用户日常浏览器（Chrome / Edge / Chromium 等）
-// 要求：浏览器已开启 remote debugging（chrome://inspect#remote-debugging toggle）
+// CDP Proxy - 通过 HTTP API 操控用户日常浏览器（任意 Chromium 内核浏览器，按数据目录选定）
+// 要求：浏览器已开启 remote debugging（chrome://inspect/#remote-debugging toggle，Edge 为 edge://）
 // Node.js 22+（使用原生 WebSocket）
 
 import http from 'node:http';
@@ -10,8 +10,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { createCdpConnection } from './cdp-connection.mjs';
-import { selectBrowser } from './browser-discovery.mjs';
-import { userDataPaths } from './user-data.mjs';
+import { selectBrowser, explainUnavailable } from './browser-discovery.mjs';
 
 // --- 解析命令行 --browser 参数（本次启动用哪个浏览器）---
 function parseBrowserArg() {
@@ -60,59 +59,36 @@ if (typeof globalThis.WebSocket !== 'undefined') {
   }
 }
 
-// proxy 启动时连接到的浏览器（用于 /health 暴露给 check-deps 比较）
-let connectedBrowser = null; // { id, label, source }
+// proxy 启动时连接到的浏览器（用于 /health 暴露给 check-deps 与维护命令比较）
+let connectedBrowser = null; // { id: 数据目录路径, label: 显示名, source }
 
-// pin 首次成功连接的浏览器 id。重连时只接受同一 id，避免悄悄降级到别的浏览器。
-let pinnedBrowserId = null;
+// pin 首次成功连接的浏览器身份（数据目录）。重连时只接受同一身份，避免悄悄换到别的浏览器。
+let pinnedBrowser = null; // { id, label }
 
-// --- 自动发现浏览器调试端口 ---
-// 决策完全委派给 browser-discovery.selectBrowser；此处只做日志和返回结构包装。
+// --- 发现浏览器调试端口 ---
+// 决策完全委派给 browser-discovery.selectBrowser；此处只做 pin 校验、日志和返回结构包装。
+// 不可用一律抛错（由下一次请求重试），不扫描固定端口、不换浏览器。
 async function discoverChromePort() {
   const result = await selectBrowser(BROWSER_OVERRIDE);
   if (result.kind === 'config-error') throw new Error(result.message);
-  if (result.kind === 'ok') {
-    if (pinnedBrowserId && pinnedBrowserId !== result.browser.id) {
-      throw new Error(
-        `本次连接的浏览器已经是 ${pinnedBrowserId}，不会自动切到 ${result.browser.id}。` +
-        `如果想换成 ${result.browser.id}，请等共享任务完成，通过 proxy-maintenance.mjs stop 停止后再指定 --browser。`
-      );
-    }
-    connectedBrowser = { id: result.browser.id, label: result.browser.label, source: result.source };
-    const tag = result.source === 'override' ? '[--browser 指定]' : '[config.env 偏好]';
-    console.log(`[CDP Proxy] 选用 ${result.browser.label} (端口 ${result.browser.port}${result.browser.wsPath ? '，带 wsPath' : ''}) ${tag}`);
-    return { port: result.browser.port, wsPath: result.browser.wsPath };
+  if (result.kind === 'unset') {
+    throw new Error('尚未设置浏览器。请先运行 node scripts/check-deps.mjs 完成首次配置（写入 WEB_ACCESS_BROWSER），或启动时指定 --browser <数据目录路径>。');
   }
-  // mismatch：有显式偏好但未检测到 —— 硬错，绝不降级
-  if (result.kind === 'mismatch') {
-    const expected = result.override || result.configured;
-    const denied = result.inaccessible?.find(browser => browser.id === expected);
-    if (denied) {
-      throw new Error(`无法读取 ${denied.label} 的调试端口文件（${denied.code}）。` +
-        `请允许文件访问，或在 ${userDataPaths().config} 为 WEB_ACCESS_BROWSER 设置已核对的 WEB_ACCESS_CDP_PORT；不会猜测端口或切换浏览器。`);
-    }
-    const src = result.source === 'override' ? '本次指定' : '默认偏好';
+  if (result.kind === 'unavailable') {
+    const steps = explainUnavailable(result).join(' ');
+    const switchHint = pinnedBrowser ? '若想换成其他浏览器，请等共享任务完成，通过 proxy-maintenance.mjs stop 停止后再指定 --browser。' : '';
+    throw new Error(`${steps} ${switchHint}`.trim());
+  }
+  if (pinnedBrowser && pinnedBrowser.id !== result.browser.id) {
     throw new Error(
-      `${src}的浏览器是 "${expected}"，但没连上。Agent 处理顺序：` +
-      `(1) 先用系统命令打开 ${expected}（按平台选择，如 macOS 的 open -a），稍等后重试请求；` +
-      `(2) 若仍失败，说明远程调试开关没启用 —— 告知用户在地址栏访问 ${expected}://inspect/#remote-debugging 勾选 "Allow remote debugging for this browser instance"。`
+      `本次连接的浏览器已经是 ${pinnedBrowser.label}（${pinnedBrowser.id}），不会自动切到 ${result.browser.label}（${result.browser.id}）。` +
+      `如果想换浏览器，请等共享任务完成，通过 proxy-maintenance.mjs stop 停止后再指定 --browser。`
     );
   }
-  if (result.inaccessible?.length) {
-    throw new Error(`无法读取浏览器调试端口文件（${result.inaccessible.map(b => `${b.label}: ${b.code}`).join('、')}）。` +
-      `请允许文件访问，或在 ${userDataPaths().config} 明确配置 WEB_ACCESS_BROWSER 与已核对的 WEB_ACCESS_CDP_PORT。`);
-  }
-  // 已 pin 过浏览器（如首次连上 edge 后 edge 退出）：拒绝任何 fallback
-  if (pinnedBrowserId) {
-    throw new Error(
-      `本次连接的浏览器是 ${pinnedBrowserId}，但现在没连上。Agent 处理顺序：` +
-      `(1) 先用系统命令打开 ${pinnedBrowserId}（按平台选择），稍等后重试请求；` +
-      `(2) 若仍失败，告知用户在地址栏访问 ${pinnedBrowserId}://inspect/#remote-debugging 重新勾选允许。` +
-      `若想换成其他浏览器，请等共享任务完成，通过 proxy-maintenance.mjs stop 停止后再指定 --browser。`
-    );
-  }
-  // 没有偏好也没有 override：不扫描 9222 等固定端口，由前置检查询问用户。
-  throw new Error('尚未选定浏览器。请先运行 node scripts/check-deps.mjs，按提示设置 WEB_ACCESS_BROWSER，或启动时指定 --browser。');
+  connectedBrowser = { id: result.browser.id, label: result.browser.label, source: result.source };
+  const tag = result.source === 'override' ? '[--browser 指定]' : '[config.env 偏好]';
+  console.log(`[CDP Proxy] 选用 ${result.browser.label}（${result.browser.id}，端口 ${result.browser.port}${result.browser.wsPath ? '，带 wsPath' : ''}）${tag}`);
+  return { port: result.browser.port, wsPath: result.browser.wsPath };
 }
 
 function getWebSocketUrl(port, wsPath) {
@@ -130,9 +106,7 @@ const connection = createCdpConnection({
     return getWebSocketUrl(discovered.port, discovered.wsPath);
   },
   onConnect: () => {
-    if (connectedBrowser?.id && connectedBrowser.id !== 'unknown') {
-      pinnedBrowserId = connectedBrowser.id;
-    }
+    pinnedBrowser = { id: connectedBrowser.id, label: connectedBrowser.label };
     lifecycleLog(`已连接浏览器 (端口 ${chromePort})`);
   },
   onDisconnect: (error) => {

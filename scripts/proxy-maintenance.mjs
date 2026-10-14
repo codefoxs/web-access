@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { sameBrowser } from './browser-discovery.mjs';
 
 const SCRIPTS = path.dirname(fileURLToPath(import.meta.url));
 const STOP_TIMEOUT_MS = 15000;
@@ -134,8 +135,9 @@ function restartedResult(health, previous, reused, startup) {
     throw new MaintenanceError('维护后仍是旧实例，没有确认升级完成', { health, startup });
   }
   const expectedBrowserId = previous?.browser?.id;
+  // 浏览器身份按数据目录比较：升级前实例报告的旧值 chrome 与新实例报告的标准路径是同一浏览器。
   if (typeof expectedBrowserId === 'string' && expectedBrowserId && expectedBrowserId !== 'unknown'
-    && health.browser?.id !== expectedBrowserId) {
+    && !sameBrowser(health.browser?.id, expectedBrowserId)) {
     throw new MaintenanceError('新实例的浏览器不符合维护前的选择；新实例已保留', {
       status: 'conflict', expectedBrowserId, health, ...(startup ? { startup } : {}),
     }, 2);

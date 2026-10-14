@@ -28,12 +28,15 @@ export function waitBarrier(name) {
   });
 }
 `;
+// 提示文案用真实实现；选择结果可由 TEST_SELECT 指定。Proxy 不得再有固定端口兜底：真实模块不导出它，导入即失败。
 const DISCOVERY = `
 import { record, waitBarrier } from './fake-runtime.mjs';
+export * from './browser-discovery-real.mjs';
 export async function selectBrowser() {
   record('discovery');
   if (process.env.TEST_HOLD_DISCOVERY === '1') await waitBarrier('discovery');
-  return { kind: 'ok', browser: { id: 'chrome', label: 'Fake Chrome', port: 9222, wsPath: '/fake-browser' }, source: 'preference' };
+  if (process.env.TEST_SELECT) return JSON.parse(process.env.TEST_SELECT);
+  return { kind: 'ok', browser: { id: '/fake/Google/Chrome', label: 'Chrome', port: 9222, wsPath: '/fake-browser' }, source: 'preference' };
 }
 `;
 const PRELOAD = `
@@ -138,6 +141,7 @@ async function fixture(t, flags = {}) {
     await fsp.copyFile(path.join(SCRIPTS, name), path.join(scripts, name));
   }
   await fsp.writeFile(path.join(scripts, 'fake-runtime.mjs'), RUNTIME);
+  await fsp.copyFile(path.join(SCRIPTS, 'browser-discovery.mjs'), path.join(scripts, 'browser-discovery-real.mjs'));
   await fsp.writeFile(path.join(scripts, 'browser-discovery.mjs'), DISCOVERY);
   await fsp.writeFile(path.join(scripts, 'preload.mjs'), PRELOAD);
   const reservation = http.createServer();
@@ -399,3 +403,27 @@ test('维护过程中普通 API 返回 503，释放退出屏障后正常退出',
   await f.release('shutdown');
   assert.equal((await entry.exited).code, 0);
 });
+
+for (const { name, select, pattern } of [
+  { name: '未设置浏览器', select: { kind: 'unset' }, pattern: /尚未设置浏览器.*check-deps/ },
+  {
+    name: '所选浏览器不可用',
+    select: { kind: 'unavailable', source: 'preference', reason: 'not-enabled', browser: { id: '/fake/Dia/User Data', label: 'Dia' } },
+    pattern: /默认偏好的浏览器 Dia.*chrome:\/\/inspect\/#remote-debugging.*edge:\/\/inspect\/#remote-debugging/,
+  },
+]) {
+  test(`${name}时请求硬错，不建立 socket、不扫描其他端口`, { timeout: 12000 }, async t => {
+    const f = await fixture(t, { TEST_SELECT: JSON.stringify(select) });
+    const entry = f.spawn();
+    await f.waitEvent(events => events.find(event => event.action === 'discovery' && event.pid === entry.child.pid));
+    const response = await requestJson(f.port, '/targets');
+    assert.equal(response.status, 500);
+    assert.match(response.body.error, pattern);
+    const health = (await requestJson(f.port, '/health')).body;
+    assert.equal(health.connected, false);
+    assert.equal(health.browser, null);
+    assert.equal((await f.events()).filter(event => event.action === 'socket').length, 0);
+    assert.equal((await shutdown(f, health)).status, 202);
+    assert.equal((await entry.exited).code, 0);
+  });
+}

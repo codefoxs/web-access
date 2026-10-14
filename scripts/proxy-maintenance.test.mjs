@@ -21,7 +21,9 @@ async function fixture(t) {
   const scripts = path.join(root, 'scripts');
   const eventsPath = path.join(root, 'events.jsonl');
   await fs.mkdir(scripts);
-  await fs.copyFile(path.join(SCRIPTS, 'proxy-maintenance.mjs'), path.join(scripts, 'proxy-maintenance.mjs'));
+  for (const name of ['proxy-maintenance.mjs', 'browser-discovery.mjs', 'user-data.mjs']) {
+    await fs.copyFile(path.join(SCRIPTS, name), path.join(scripts, name));
+  }
   await fs.writeFile(path.join(scripts, 'fake-proxy.mjs'), `
 import fs from 'node:fs';
 import http from 'node:http';
@@ -49,11 +51,13 @@ server.listen(Number(process.env.CDP_PROXY_PORT), '127.0.0.1', () => record({ ac
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { resolveBrowser } from './browser-discovery.mjs';
 const record = event => fs.appendFileSync(process.env.TEST_EVENTS_PATH, JSON.stringify(event) + '\\n');
 record({ action: 'startup', args: process.argv.slice(2) });
 if (process.env.TEST_START_MODE === 'absent') process.exit(1);
 const browserFlag = process.argv.indexOf('--browser');
-const browserId = browserFlag === -1 ? 'edge' : process.argv[browserFlag + 1];
+// 与真实 Proxy 一样报告规范化后的数据目录（旧值 edge → 标准路径）
+const browserId = resolveBrowser(browserFlag === -1 ? 'edge' : process.argv[browserFlag + 1]).id;
 const child = spawn(process.execPath, [fileURLToPath(new URL('./fake-proxy.mjs', import.meta.url))], {
   detached: true, stdio: 'ignore', windowsHide: true,
   env: { ...process.env, TEST_BOOT_BROWSER: browserId },
@@ -95,7 +99,10 @@ globalThis.setTimeout = (callback, delay, ...args) => original(callback, Math.mi
     events,
     async run(port, args = [], startMode = 'connected') {
       const child = spawn(process.execPath, ['--import', preload, path.join(scripts, 'proxy-maintenance.mjs'), ...args], {
-        env: { ...process.env, CDP_PROXY_PORT: String(port), TEST_EVENTS_PATH: eventsPath, TEST_START_MODE: startMode },
+        env: {
+          ...process.env, CDP_PROXY_PORT: String(port), TEST_EVENTS_PATH: eventsPath, TEST_START_MODE: startMode,
+          HOME: root, USERPROFILE: root, LOCALAPPDATA: path.join(root, 'AppData', 'Local'),
+        },
         stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
       });
       let stdout = '';
@@ -468,4 +475,32 @@ test('参数与端口校验发生在任何 HTTP 或启动动作之前', async t 
   assert.equal((await f.run('bad-port', ['restart'])).code, 2);
   assert.deepEqual(proxy.requests, []);
   assert.deepEqual(await f.events(), []);
+});
+
+test('restart 升级前实例报告旧值、新实例报告标准路径时视为同一浏览器', async t => {
+  const f = await fixture(t);
+  const proxy = await fakeProxy(t, { health: { ...oldHealth, browser: { id: 'chrome', label: 'Chrome' } } });
+  const result = await f.run(proxy.port, ['restart']);
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(result.output.status, 'ready');
+  assert.notEqual(result.output.health.browser.id, 'chrome');
+  assert.ok(path.isAbsolute(result.output.health.browser.id));
+  assert.deepEqual((await f.events()).filter(event => event.action === 'startup'), [{ action: 'startup', args: ['--browser', 'chrome'] }]);
+});
+
+test('restart 保留路径形式的原浏览器选择，数据目录不同则 conflict', async t => {
+  const f = await fixture(t);
+  const dia = path.join(os.tmpdir(), 'Dia', 'User Data');
+  const proxy = await fakeProxy(t, { health: { ...oldHealth, browser: { id: dia, label: 'Dia' } } });
+  const result = await f.run(proxy.port, ['restart']);
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(result.output.health.browser.id, dia);
+  assert.deepEqual((await f.events()).filter(event => event.action === 'startup'), [{ action: 'startup', args: ['--browser', dia] }]);
+
+  const g = await fixture(t);
+  const other = await fakeProxy(t, { health: { ...oldHealth, browser: { id: dia, label: 'Dia' } } });
+  const conflict = await g.run(other.port, ['restart'], 'different-browser');
+  assert.equal(conflict.code, 2, `${conflict.stdout}\n${conflict.stderr}`);
+  assert.equal(conflict.output.status, 'conflict');
+  assert.equal(conflict.output.expectedBrowserId, dia);
 });

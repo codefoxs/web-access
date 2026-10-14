@@ -1,0 +1,236 @@
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs/promises';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import test from 'node:test';
+
+const SCRIPTS = path.dirname(fileURLToPath(import.meta.url));
+
+// 平台与 HOME 在子进程内模拟；应用数据目录、浏览器数据目录都是临时树，端口为随机本机端口。
+// 子进程记录目录列举、文件读取与 TCP 连接，用来证明「只列根目录本身」「不读浏览器数据内容」「只做 TCP」。
+const PRELOAD = `
+import fs from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
+const opts = JSON.parse(process.env.TEST_OPTS);
+os.platform = () => opts.platform;
+os.homedir = () => opts.home;
+const record = { connections: 0, reads: [], readdirs: [] };
+const originalConnect = net.createConnection;
+net.createConnection = (...args) => { record.connections++; return originalConnect(...args); };
+const originalRead = fs.readFileSync;
+fs.readFileSync = (file, ...args) => { record.reads.push(String(file)); return originalRead(file, ...args); };
+const originalReaddir = fs.readdirSync;
+fs.readdirSync = (dir, ...args) => { record.readdirs.push(String(dir)); return originalReaddir(dir, ...args); };
+const originalWrite = fs.writeFileSync;
+process.on('exit', () => originalWrite(process.env.TEST_RECORD, JSON.stringify(record)));
+`;
+const RUNNER = `
+const opts = JSON.parse(process.env.TEST_OPTS);
+const probe = await import(new URL('./scripts/browser-probe.mjs', import.meta.url));
+let result;
+if (opts.action === 'roots') result = probe.appDataRoots();
+else if (opts.action === 'list') result = probe.listTopFolders(opts.root);
+else if (opts.action === 'resolve') result = probe.resolveFolder(opts.folder);
+else result = await probe.probeFolder(opts.folder);
+console.log(JSON.stringify(result));
+`;
+
+async function fixture(t, { platform = 'darwin' } = {}) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'web-access-probe-'));
+  const scripts = path.join(root, 'scripts');
+  const home = path.join(root, 'home dir');
+  const localAppData = path.join(root, 'AppData', 'Local');
+  const appData = path.join(root, 'AppData', 'Roaming');
+  await fs.mkdir(scripts, { recursive: true });
+  for (const name of ['browser-probe.mjs', 'browser-discovery.mjs', 'user-data.mjs']) {
+    await fs.copyFile(path.join(SCRIPTS, name), path.join(scripts, name));
+  }
+  await fs.writeFile(path.join(root, 'preload.mjs'), PRELOAD);
+  await fs.writeFile(path.join(root, 'runner.mjs'), RUNNER);
+  const appRoot = { darwin: path.join(home, 'Library', 'Application Support'), linux: path.join(home, '.config'), win32: localAppData }[platform];
+  for (const dir of [home, appRoot, localAppData, appData].filter(Boolean)) await fs.mkdir(dir, { recursive: true });
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+
+  const exec = async (args, options = {}) => {
+    const recordPath = path.join(root, `record-${Math.random().toString(36).slice(2)}.json`);
+    const child = spawn(process.execPath, ['--import', path.join(root, 'preload.mjs'), ...args], {
+      env: {
+        ...process.env, TEST_OPTS: JSON.stringify({ platform, home, ...options }), TEST_RECORD: recordPath,
+        LOCALAPPDATA: localAppData, APPDATA: appData,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const watchdog = setTimeout(() => child.kill('SIGKILL'), 10000);
+    try {
+      const code = await new Promise((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', resolve);
+      });
+      const record = JSON.parse(await fs.readFile(recordPath, 'utf8'));
+      return { code, stdout, stderr, ...record };
+    } finally { clearTimeout(watchdog); }
+  };
+  return {
+    root, home, appRoot, localAppData, appData,
+    async call(action, options = {}) {
+      const outcome = await exec([path.join(root, 'runner.mjs')], { action, ...options });
+      assert.equal(outcome.code, 0, `${outcome.stdout}\n${outcome.stderr}`);
+      return { ...outcome, result: JSON.parse(outcome.stdout.trim()) };
+    },
+    cli: (...args) => exec([path.join(scripts, 'browser-probe.mjs'), ...args]),
+    // 建浏览器数据目录：Local State + 可选 DevToolsActivePort + 一个 profile 子目录（探测不应进入）
+    async browser(base, relative, portFile = null) {
+      const dir = path.join(base, relative);
+      await fs.mkdir(path.join(dir, 'Default'), { recursive: true });
+      await fs.writeFile(path.join(dir, 'Local State'), '{"secret":"不应被读取"}');
+      await fs.writeFile(path.join(dir, 'Default', 'Preferences'), '{}');
+      if (portFile !== null) await fs.writeFile(path.join(dir, 'DevToolsActivePort'), portFile);
+      return dir;
+    },
+  };
+}
+
+async function fakeHttp(t) {
+  let requests = 0;
+  const server = http.createServer((_req, res) => { requests++; res.end('{}'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  });
+  return { port: server.address().port, requests: () => requests };
+}
+
+async function closedPort() {
+  const server = http.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  await new Promise(resolve => server.close(resolve));
+  return port;
+}
+
+test('应用数据根目录：macOS Application Support、Linux ~/.config、Windows LOCALAPPDATA 与 APPDATA', async t => {
+  for (const platform of ['darwin', 'linux', 'win32', 'unsupported-os']) {
+    const f = await fixture(t, { platform });
+    const { result } = await f.call('roots');
+    const expected = {
+      darwin: [path.join(f.home, 'Library', 'Application Support')],
+      linux: [path.join(f.home, '.config')],
+      win32: [f.localAppData, f.appData],
+      'unsupported-os': [],
+    }[platform];
+    assert.deepEqual(result, expected, platform);
+  }
+});
+
+test('列根目录只读根目录本身：只给文件夹名，不进入任何文件夹，不读文件不发 TCP', async t => {
+  const f = await fixture(t);
+  const server = await fakeHttp(t);
+  await f.browser(f.appRoot, 'Google/Chrome', `${server.port}\n/x\n`);
+  await f.browser(f.appRoot, 'Dia/User Data');
+  await fs.writeFile(path.join(f.appRoot, 'notes.txt'), 'file');
+  const { result, readdirs, reads, connections } = await f.call('list', { root: f.appRoot });
+  assert.deepEqual(result, { root: f.appRoot, folders: ['Dia', 'Google'] });
+  assert.deepEqual(readdirs, [f.appRoot]);
+  assert.ok(!reads.some(file => file.startsWith(f.appRoot)), reads.join('\n'));
+  assert.equal(connections, 0);
+  assert.equal(server.requests(), 0);
+});
+
+test('根目录不可列出时报告错误码，不抛出', async t => {
+  const f = await fixture(t);
+  const missing = path.join(f.root, 'missing');
+  const { result } = await f.call('list', { root: missing });
+  assert.deepEqual(result, { root: missing, code: 'ENOENT' });
+});
+
+test('探测 Dia：识别 User Data，报告远程调试已开启；不进入 profile、只读端口文件、只发 TCP', async t => {
+  const f = await fixture(t);
+  const server = await fakeHttp(t);
+  const dia = await f.browser(f.appRoot, 'Dia/User Data', `${server.port}\r\n/devtools/browser/dia\r\n`);
+  const folder = path.join(f.appRoot, 'Dia');
+  const { result, readdirs, reads, connections } = await f.call('probe', { folder });
+  assert.deepEqual(result, {
+    folder, skipped: [], truncated: false,
+    browsers: [{ dataDir: dia, name: 'Dia', remoteDebugging: { enabled: true, port: server.port } }],
+  });
+  assert.deepEqual(readdirs, [folder]);
+  assert.deepEqual(reads.filter(file => file.startsWith(f.appRoot)), [path.join(dia, 'DevToolsActivePort')]);
+  assert.equal(connections, 1);
+  assert.equal(server.requests(), 0);
+});
+
+test('探测 Google：同一文件夹下的多个浏览器分别报告未开启原因，非浏览器子目录不误报', async t => {
+  const f = await fixture(t);
+  const stale = await closedPort();
+  const chrome = await f.browser(f.appRoot, 'Google/Chrome', `${stale}\n/stale\n`);
+  const canary = await f.browser(f.appRoot, 'Google/Chrome Canary');
+  await fs.mkdir(path.join(f.appRoot, 'Google', 'GoogleUpdater', 'crx_cache'), { recursive: true });
+  const { result, connections } = await f.call('probe', { folder: path.join(f.appRoot, 'Google') });
+  const byName = Object.fromEntries(result.browsers.map(browser => [browser.name, browser]));
+  assert.deepEqual(Object.keys(byName).sort(), ['Chrome', 'Chrome Canary']);
+  assert.equal(byName.Chrome.dataDir, chrome);
+  assert.equal(byName.Chrome.remoteDebugging.enabled, false);
+  assert.match(byName.Chrome.remoteDebugging.detail, new RegExp(`端口 ${stale} 未在监听`));
+  assert.equal(byName['Chrome Canary'].dataDir, canary);
+  assert.match(byName['Chrome Canary'].remoteDebugging.detail, /没有 DevToolsActivePort/);
+  assert.equal(connections, 1);
+});
+
+test('探测深度有界：第 3 层能找到，第 4 层不再深入', async t => {
+  const f = await fixture(t);
+  const vendor = path.join(f.appRoot, 'Vendor');
+  const shallow = await f.browser(vendor, 'a/b/Shallow');
+  await f.browser(vendor, 'c/d/e/Deep');
+  const { result, readdirs } = await f.call('probe', { folder: vendor });
+  assert.deepEqual(result.browsers.map(browser => browser.dataDir), [shallow]);
+  assert.ok(!readdirs.some(dir => dir.endsWith(path.join('c', 'd', 'e'))), readdirs.join('\n'));
+});
+
+test('文件夹参数：名字在应用数据根目录下查找，绝对路径与 ~ 原样使用，数据目录本身也可直接探测', async t => {
+  const f = await fixture(t);
+  const dia = await f.browser(f.appRoot, 'Dia/User Data');
+  assert.deepEqual((await f.call('resolve', { folder: 'Dia' })).result, [path.join(f.appRoot, 'Dia')]);
+  assert.deepEqual((await f.call('resolve', { folder: 'NotInstalled' })).result, []);
+  assert.deepEqual((await f.call('resolve', { folder: '~/Library/Application Support/Dia/' })).result, [path.join(f.appRoot, 'Dia')]);
+  const { result } = await f.call('probe', { folder: dia });
+  assert.deepEqual(result.browsers.map(browser => browser.dataDir), [dia]);
+});
+
+test('Windows 文件夹名同时在 LOCALAPPDATA 与 APPDATA 下查找（Opera 位于 Roaming）', async t => {
+  const f = await fixture(t, { platform: 'win32' });
+  await fs.mkdir(path.join(f.appData, 'Opera Software'), { recursive: true });
+  const { result } = await f.call('resolve', { folder: 'Opera Software' });
+  assert.deepEqual(result, [path.join(f.appData, 'Opera Software')]);
+});
+
+test('命令行输出数据目录、调试状态与可直接写入的配置行，退出码区分是否找到', async t => {
+  const f = await fixture(t);
+  const server = await fakeHttp(t);
+  const dia = await f.browser(f.appRoot, 'Dia/User Data', `${server.port}\n/devtools/browser/dia\n`);
+  const brave = await f.browser(f.appRoot, 'BraveSoftware/Brave-Browser');
+  const found = await f.cli('Dia', 'BraveSoftware');
+  assert.equal(found.code, 0, found.stdout + found.stderr);
+  assert.ok(found.stdout.includes(`- Dia：${dia}`), found.stdout);
+  assert.match(found.stdout, new RegExp(`远程调试：已开启（端口 ${server.port} 在监听）`));
+  assert.ok(found.stdout.includes(`WEB_ACCESS_BROWSER=${dia}`), found.stdout);
+  assert.ok(found.stdout.includes(`- Brave-Browser：${brave}`), found.stdout);
+  assert.ok(found.stdout.includes('chrome://inspect/#remote-debugging'), found.stdout);
+  assert.ok(found.stdout.includes('edge://inspect/#remote-debugging'), found.stdout);
+  assert.equal(server.requests(), 0);
+
+  await fs.mkdir(path.join(f.appRoot, 'Slack'), { recursive: true });
+  const none = await f.cli('Slack', 'NotInstalled');
+  assert.equal(none.code, 1);
+  assert.match(none.stdout, /未找到 Chromium 浏览器数据目录/);
+  assert.match(none.stdout, /应用数据根目录下没有这个文件夹/);
+  assert.equal((await f.cli()).code, 2);
+});

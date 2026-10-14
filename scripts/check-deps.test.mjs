@@ -9,6 +9,22 @@ import test from 'node:test';
 
 const SCRIPTS = path.dirname(fileURLToPath(import.meta.url));
 
+// 旧配置值在当前宿主平台的标准数据目录（与 browser-discovery 的兼容映射一致，用于断言路径身份）
+function legacyDataDir(f, alias) {
+  const relative = {
+    darwin: { chrome: ['Library', 'Application Support', 'Google', 'Chrome'], edge: ['Library', 'Application Support', 'Microsoft Edge'] },
+    linux: { chrome: ['.config', 'google-chrome'], edge: ['.config', 'microsoft-edge'] },
+    win32: { chrome: ['Google', 'Chrome', 'User Data'], edge: ['Microsoft', 'Edge', 'User Data'] },
+  }[process.platform][alias];
+  return path.join(process.platform === 'win32' ? f.localAppData : f.home, ...relative);
+}
+
+// 当前宿主平台的应用数据根目录（首次配置时 check-deps 列出其最外层文件夹）
+function appDataRoot(f) {
+  if (process.platform === 'win32') return f.localAppData;
+  return process.platform === 'darwin' ? path.join(f.home, 'Library', 'Application Support') : path.join(f.home, '.config');
+}
+
 // 所有检查在脚本副本、临时 HOME、临时配置和本地假服务上运行，不接触真实浏览器与真实用户数据。
 async function fixture(t, { configured = null } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'web-access-check-deps-'));
@@ -18,39 +34,45 @@ async function fixture(t, { configured = null } = {}) {
   const temporary = path.join(root, 'tmp');
   const eventsPath = path.join(root, 'events.jsonl');
   const configPath = path.join(home, '.web-access', 'config.env');
+  const localAppData = path.join(root, 'AppData', 'Local');
+  const appData = path.join(root, 'AppData', 'Roaming');
+  await fs.mkdir(localAppData, { recursive: true });
+  await fs.mkdir(appData, { recursive: true });
   await fs.mkdir(scripts, { recursive: true });
   await fs.mkdir(temporary);
   await fs.mkdir(path.join(skill, 'templates'));
   await fs.mkdir(path.dirname(configPath), { recursive: true });
   await fs.copyFile(path.join(SCRIPTS, 'check-deps.mjs'), path.join(scripts, 'check-deps.mjs'));
   await fs.copyFile(path.join(SCRIPTS, 'user-data.mjs'), path.join(scripts, 'user-data.mjs'));
+  await fs.copyFile(path.join(SCRIPTS, 'browser-probe.mjs'), path.join(scripts, 'browser-probe.mjs'));
   await fs.copyFile(path.join(SCRIPTS, 'browser-discovery.mjs'), path.join(scripts, 'browser-discovery-real.mjs'));
   await fs.writeFile(configPath, configured ? `WEB_ACCESS_BROWSER=${configured}\n` : '');
 
-  // 只保留真实的偏好读取；发现浏览器与启动 Proxy 均记录副作用。
+  // 身份解析、偏好读取与提示文案用真实实现；只替换选择结果（可由 TEST_SELECT 指定），并记录调用。
   await fs.writeFile(path.join(scripts, 'browser-discovery.mjs'), `
 import fs from 'node:fs';
-import { getConfiguredBrowserId } from './browser-discovery-real.mjs';
-export { getConfiguredBrowserId };
+import { getConfiguredBrowser, resolveBrowser } from './browser-discovery-real.mjs';
+export * from './browser-discovery-real.mjs';
 const record = event => fs.appendFileSync(process.env.TEST_EVENTS_PATH, JSON.stringify(event) + '\\n');
-export function knownBrowsers() {
-  return [{ id: 'chrome', label: 'Chrome' }, { id: 'edge', label: 'Microsoft Edge' }];
-}
 export async function selectBrowser(override) {
   record({ action: 'selectBrowser', override });
-  const id = override || getConfiguredBrowserId() || 'chrome';
-  return { kind: 'ok', browser: { id, label: id, port: 9222 }, source: override ? 'override' : 'preference' };
+  if (process.env.TEST_SELECT) return JSON.parse(process.env.TEST_SELECT);
+  const raw = override || getConfiguredBrowser();
+  if (!raw) return { kind: 'unset' };
+  return { kind: 'ok', browser: { ...resolveBrowser(raw), port: 9222 }, source: override ? 'override' : 'preference' };
 }
 `);
+  // 假 Proxy 与真实实现一样报告规范化后的数据目录作为浏览器身份。
   await fs.writeFile(path.join(scripts, 'cdp-proxy.mjs'), `
 import fs from 'node:fs';
 import http from 'node:http';
+import { getConfiguredBrowser, resolveBrowser } from './browser-discovery-real.mjs';
 fs.appendFileSync(process.env.TEST_EVENTS_PATH, JSON.stringify({ action: 'spawn', pid: process.pid, args: process.argv.slice(2) }) + '\\n');
 const i = process.argv.indexOf('--browser');
-const id = i === -1 ? 'chrome' : process.argv[i + 1];
+const browser = resolveBrowser(i === -1 ? getConfiguredBrowser() : process.argv[i + 1]);
 http.createServer((req, res) => {
   res.setHeader('content-type', 'application/json');
-  res.end(JSON.stringify(req.url === '/health' ? { status: 'ok', connected: true, browser: { id, label: id } } : []));
+  res.end(JSON.stringify(req.url === '/health' ? { status: 'ok', connected: true, browser } : []));
 }).listen(Number(process.env.CDP_PROXY_PORT), '127.0.0.1');
 `);
   // 缩短脚本的轮询间隔，保留实际 HTTP 交互与成功/超时分支。
@@ -81,19 +103,23 @@ globalThis.setTimeout = (callback, delay, ...args) => originalSetTimeout(callbac
     root,
     skill,
     home,
+    localAppData,
     configPath,
     events,
-    async run(port, args = []) {
+    async run(port, args = [], extraEnv = {}) {
       const child = spawn(process.execPath, ['--import', preload, path.join(scripts, 'check-deps.mjs'), ...args], {
         env: {
           ...process.env,
           CDP_PROXY_PORT: String(port),
           HOME: home,
           USERPROFILE: home,
+          LOCALAPPDATA: localAppData,
+          APPDATA: appData,
           TEST_EVENTS_PATH: eventsPath,
           TMPDIR: temporary,
           TMP: temporary,
           TEMP: temporary,
+          ...extraEnv,
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -285,7 +311,7 @@ test('没有服务时才发现浏览器并启动可在检查结束后继续运�
   assert.deepEqual(events.find(event => event.action === 'spawn').args, ['--browser', 'edge']);
   const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
   assert.equal(health.connected, true);
-  assert.equal(health.browser.id, 'edge');
+  assert.equal(health.browser.id, legacyDataDir(f, 'edge'));
 });
 
 test('旧版本 Skill 目录内的偏好与站点经验在启动早期迁到 HOME/.web-access 并生效', async t => {
@@ -341,4 +367,83 @@ test('迁移失败只提示一行警告，不阻塞前置检查', async t => {
   success(result);
   assert.equal(result.stdout.split('\n').filter(line => line.startsWith('user-data: warn')).length, 1);
   assert.equal(await fs.readFile(path.join(f.skill, 'config.env'), 'utf8'), 'WEB_ACCESS_BROWSER=chrome\n');
+});
+
+async function unusedPort() {
+  const reservation = http.createServer();
+  await new Promise(resolve => reservation.listen(0, '127.0.0.1', resolve));
+  const port = reservation.address().port;
+  await new Promise(resolve => reservation.close(resolve));
+  return port;
+}
+
+test('未设置浏览器时 exit 2：列出应用数据根目录的最外层文件夹名与探测命令，不进入文件夹、不启动服务', async t => {
+  const f = await fixture(t);
+  const root = appDataRoot(f);
+  await fs.mkdir(path.join(root, 'Dia', 'User Data', 'NestedProfileMarker'), { recursive: true });
+  await fs.mkdir(path.join(root, 'Google', 'Chrome'), { recursive: true });
+  await fs.writeFile(path.join(root, 'loose-file.txt'), 'x');
+  const result = await f.run(await unusedPort());
+  assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /browser: 未设置/);
+  assert.ok(result.stdout.includes(`应用数据根目录 ${root} 下的文件夹：`), result.stdout);
+  assert.match(result.stdout, /^ {4}Dia, Google$/m);
+  assert.doesNotMatch(result.stdout, /NestedProfileMarker|User Data|loose-file/);
+  assert.ok(result.stdout.includes(path.join(f.skill, 'scripts', 'browser-probe.mjs')), result.stdout);
+  assert.match(result.stdout, /即使只找到一个也要问/);
+  assert.ok(result.stdout.includes(`${f.configPath}：WEB_ACCESS_BROWSER=<数据目录路径>`), result.stdout);
+  assert.ok(result.stdout.includes('chrome://inspect/#remote-debugging'));
+  assert.ok(result.stdout.includes('edge://inspect/#remote-debugging'));
+  const events = await f.events();
+  assert.equal(events.filter(event => event.action === 'selectBrowser').length, 1);
+  assert.equal(events.filter(event => event.action === 'spawn').length, 0);
+});
+
+test('所选浏览器不可用时 exit 1：用显示名给出处理顺序与通用 inspect 地址，不启动服务', async t => {
+  const f = await fixture(t, { configured: '~/Dia/User Data' });
+  const select = {
+    kind: 'unavailable', source: 'preference', reason: 'not-enabled',
+    browser: { id: path.join(f.home, 'Dia', 'User Data'), label: 'Dia' },
+  };
+  const result = await f.run(await unusedPort(), [], { TEST_SELECT: JSON.stringify(select) });
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(result.stdout, /browser: error — 默认偏好的浏览器 Dia/);
+  assert.match(result.stdout, /先用系统命令打开 Dia/);
+  assert.ok(result.stdout.includes('chrome://inspect/#remote-debugging'));
+  assert.ok(result.stdout.includes('edge://inspect/#remote-debugging'));
+  assert.match(result.stdout, /也可以编辑/);
+  assert.deepEqual((await f.events()).filter(event => event.action === 'spawn'), []);
+});
+
+for (const { name, configured, running } of [
+  { name: '旧配置 chrome 复用报告标准路径的新实例', configured: 'chrome', running: f => legacyDataDir(f, 'chrome') },
+  { name: '路径配置复用升级前报告旧值 chrome 的实例', configured: null, running: () => 'chrome' },
+  { name: '~ 写法的路径配置复用报告绝对路径的实例', configured: '~/Dia/User Data/', running: f => path.join(f.home, 'Dia', 'User Data') },
+]) {
+  test(`浏览器身份按数据目录比较：${name}`, async t => {
+    const f = await fixture(t, { configured });
+    if (!configured) await fs.writeFile(f.configPath, `WEB_ACCESS_BROWSER=${legacyDataDir(f, 'chrome')}\n`);
+    const proxy = await fakeProxy(t, { browser: running(f) });
+    success(await f.run(proxy.port));
+    assert.deepEqual(await f.events(), []);
+  });
+}
+
+test('路径配置与运行实例的数据目录不同则明确不一致，保留原服务', async t => {
+  const f = await fixture(t, { configured: '~/Dia/User Data' });
+  const proxy = await fakeProxy(t, { browser: legacyDataDir(f, 'chrome') });
+  const result = await f.run(proxy.port);
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(result.stdout, /浏览器不一致 — 当前实例使用 .*，但本次需要 Dia/);
+  assert.deepEqual(await f.events(), []);
+});
+
+test('没有服务时按配置的数据目录启动，Proxy 报告规范化路径', async t => {
+  const f = await fixture(t, { configured: '~/Dia/User Data/' });
+  const port = await unusedPort();
+  success(await f.run(port));
+  const events = await f.events();
+  assert.deepEqual(events.find(event => event.action === 'spawn').args, []);
+  const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+  assert.deepEqual(health.browser, { id: path.join(f.home, 'Dia', 'User Data'), label: 'Dia' });
 });

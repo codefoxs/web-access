@@ -2,18 +2,20 @@
 // 环境检查 + 确保 CDP Proxy 就绪
 //
 // 用法：
-//   node check-deps.mjs                  默认行为：读 config.env 偏好
-//   node check-deps.mjs --browser edge   本次临时指定浏览器（不写 config.env）
+//   node check-deps.mjs                         默认行为：读 config.env 偏好
+//   node check-deps.mjs --browser <数据目录>     本次临时指定浏览器（不写 config.env；也接受旧值 chrome / edge 等）
 //
 // 持久偏好 → ~/.web-access/config.env（用户数据目录，见 user-data.mjs）
 // 单次覆盖 → --browser 命令行参数（全链路 argv，不碰 process.env）
+// 未设置浏览器 → exit 2，输出应用数据根目录的最外层文件夹名和首次配置步骤（探测见 browser-probe.mjs）
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { selectBrowser, knownBrowsers, getConfiguredBrowserId } from './browser-discovery.mjs';
+import { selectBrowser, getConfiguredBrowser, sameBrowser, browserLabel, explainUnavailable, INSPECT_HINT } from './browser-discovery.mjs';
+import { appDataRoots, listTopFolders } from './browser-probe.mjs';
 import { userDataPaths, migrateLegacyData } from './user-data.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -23,6 +25,7 @@ const HEALTH_URL = `http://127.0.0.1:${PROXY_PORT}/health`;
 const USER_DATA = userDataPaths();
 const CONFIG_PATH = USER_DATA.config;
 const CONFIG_TEMPLATE = path.join(ROOT, 'templates', 'config.env.template');
+const PROBE_SCRIPT = path.join(ROOT, 'scripts', 'browser-probe.mjs');
 
 // --- 参数解析 ---
 
@@ -95,15 +98,18 @@ function startProxyDetached(browserOverride) {
   fs.closeSync(logFd);
 }
 
-function matchesBrowser(health, expectedBrowserId) {
+// 浏览器身份按数据目录比较：旧值 chrome 与其标准路径视为同一浏览器，兼容升级前已运行的实例。
+function matchesBrowser(health, expectedBrowser) {
+  if (!expectedBrowser) return true;
   const runningId = health.browser?.id;
   const runningLabel = health.browser?.label || runningId || 'unknown';
-  if (expectedBrowserId && (!runningId || runningId === 'unknown') && health.connected === true) {
-    console.log(`proxy: 无法确认当前连接的浏览器是否为 ${expectedBrowserId}，保留已有实例`);
+  if (!runningId || runningId === 'unknown') {
+    if (health.connected !== true) return true; // 断线实例恢复后会报告真实身份，再比较
+    console.log(`proxy: 无法确认当前连接的浏览器是否为 ${browserLabel(expectedBrowser)}，保留已有实例`);
     return false;
   }
-  if (expectedBrowserId && runningId && runningId !== 'unknown' && runningId !== expectedBrowserId) {
-    console.log(`proxy: 浏览器不一致 — 当前实例使用 ${runningLabel}，但本次需要 ${expectedBrowserId}`);
+  if (!sameBrowser(runningId, expectedBrowser)) {
+    console.log(`proxy: 浏览器不一致 — 当前实例使用 ${runningLabel}（${runningId}），但本次需要 ${browserLabel(expectedBrowser)}（${expectedBrowser}）`);
     console.log('  如需切换浏览器，请等共享任务完成，运行 node scripts/proxy-maintenance.mjs stop 后再指定 --browser');
     return false;
   }
@@ -160,18 +166,27 @@ async function ensureProxy(expectedBrowserId, browserOverride, health) {
   return false;
 }
 
-// --- 输出浏览器选择结果，返回是否可以继续启动 proxy ---
+// --- 首次配置：只列应用数据根目录的最外层文件夹名，不进入任何文件夹 ---
 
-function printAvailableHint(detected) {
-  const detectedIds = new Set(detected.map(b => b.id));
-  const configurable = knownBrowsers().filter(b => !detectedIds.has(b.id));
-  if (detected.length) {
-    console.log(`  已开启远程调试：${detected.map(b => `${b.label} (${b.id}, port ${b.port})`).join('、')}`);
+function printFirstRunGuide() {
+  console.log(`browser: 未设置 — 首次使用需要选定浏览器（写入 ${CONFIG_PATH} 的 WEB_ACCESS_BROWSER）`);
+  const roots = appDataRoots();
+  if (!roots.length) console.log(`  当前平台（${os.platform()}）没有已知的应用数据根目录，请向用户询问浏览器数据目录`);
+  for (const root of roots) {
+    const listing = listTopFolders(root);
+    if (listing.code) console.log(`  应用数据根目录 ${root}：无法列出（${listing.code}）`);
+    else console.log(`  应用数据根目录 ${root} 下的文件夹：\n    ${listing.folders.join(', ') || '（空）'}`);
   }
-  if (configurable.length) {
-    console.log(`  其他可配置：${configurable.map(b => `${b.label} (${b.id})`).join('、')}`);
-  }
+  console.log('  Agent 下一步：');
+  console.log('    1. 从文件夹名认出 Chromium 内核浏览器（如 Google、Microsoft Edge、BraveSoftware、Arc、Dia、Vivaldi、com.operasoftware.Opera）');
+  console.log(`    2. 只探测认出的文件夹：node "${PROBE_SCRIPT}" <文件夹名> [更多文件夹名]`);
+  console.log('    3. 把探测到的浏览器和远程调试状态告诉用户，询问用哪个（即使只找到一个也要问）');
+  console.log(`    4. 把用户选定的数据目录写入 ${CONFIG_PATH}：WEB_ACCESS_BROWSER=<数据目录路径>`);
+  console.log(`    5. 远程调试未开启时，请用户在该浏览器的${INSPECT_HINT}，再重新运行本检查`);
+  console.log('  仅本次使用（不写配置）：node check-deps.mjs --browser <数据目录路径>');
 }
+
+// --- 输出浏览器选择结果，返回是否可以继续启动 proxy ---
 
 async function resolveAndReport(override) {
   const result = await selectBrowser(override);
@@ -184,49 +199,20 @@ async function resolveAndReport(override) {
     case 'ok': {
       const sourceTag = result.source === 'override' ? '[--browser 指定]' : '[config.env 偏好]';
       console.log(`browser: ok (${result.browser.label}, port ${result.browser.port}) ${sourceTag}`);
+      console.log(`  数据目录：${result.browser.id}`);
       return { proceed: true, browserId: result.browser.id };
     }
-
-    case 'ambiguous': {
-      console.log('browser: needs decision — 用户尚未在 config.env 设置偏好');
-      printAvailableHint(result.detected);
-      console.log(`  请询问用户：哪个浏览器作为 Agent 的默认？（写入 ${CONFIG_PATH} 的 WEB_ACCESS_BROWSER）`);
-      console.log('  若仅本次使用，可重跑：node check-deps.mjs --browser <id>');
+    case 'unset': {
+      printFirstRunGuide();
       return { proceed: false, exitCode: 2 };
     }
-
-    case 'mismatch': {
-      const expected = result.override || result.configured;
-      const expectedLabel = knownBrowsers().find(b => b.id === expected)?.label || expected;
-      const sourceDesc = result.source === 'override' ? '本次指定' : '默认偏好';
-      const denied = result.inaccessible?.find(b => b.id === expected);
-      if (denied) {
-        console.log(`browser: 文件访问受限 — 无法读取 ${expectedLabel} 的调试端口文件（${denied.code}）`);
-        console.log(`  路径：${denied.devToolsPath}`);
-        console.log(`  请允许当前工具读取该文件，或在 ${CONFIG_PATH} 为 WEB_ACCESS_BROWSER 设置已核对的 WEB_ACCESS_CDP_PORT；不会猜测端口或切换浏览器`);
-        return { proceed: false, exitCode: 1 };
-      }
-      console.log(`browser: error — ${sourceDesc}的浏览器是 "${expected}" (${expectedLabel})，但没连上`);
-      console.log(`  Agent 处理顺序：`);
-      console.log(`    1. 先用系统命令打开 ${expectedLabel}（按你所在平台自行选择，如 macOS 的 open -a），再重新运行 node check-deps.mjs`);
-      console.log(`    2. 若仍报相同错误，可能是因为远程调试开关没启用 —— 告诉用户：在 ${expectedLabel} 的地址栏访问 ${expected}://inspect/#remote-debugging，勾选 "Allow remote debugging for this browser instance"`);
-      printAvailableHint(result.detected);
+    case 'unavailable': {
+      const [first, ...rest] = explainUnavailable(result);
+      console.log(`browser: error — ${first}`);
+      for (const line of rest) console.log(`  ${line}`);
       if (result.source === 'preference') {
-        console.log(`  也可以编辑 ${CONFIG_PATH} 改默认偏好，或本次临时换浏览器：node check-deps.mjs --browser <id>`);
+        console.log(`  也可以编辑 ${CONFIG_PATH} 改默认浏览器，或本次临时换浏览器：node check-deps.mjs --browser <数据目录路径>`);
       }
-      return { proceed: false, exitCode: 1 };
-    }
-
-    case 'empty': {
-      if (result.inaccessible?.length) {
-        console.log(`browser: 文件访问受限 — ${result.inaccessible.map(b => `${b.label} (${b.code})`).join('、')}`);
-        console.log(`  请允许当前工具读取调试端口文件，或在 ${CONFIG_PATH} 明确配置 WEB_ACCESS_BROWSER 与已核对的 WEB_ACCESS_CDP_PORT`);
-        return { proceed: false, exitCode: 1 };
-      }
-      // 不扫描 9222 等固定端口：独立调试浏览器不在支持范围，避免连上用户未选择的浏览器。
-      console.log('browser: 未连接 — 没有任何浏览器打开远程调试开关');
-      console.log(`  支持的浏览器：${knownBrowsers().map(b => b.label).join('、')}`);
-      console.log('  在你想用的浏览器地址栏打开 chrome://inspect/#remote-debugging 或 edge://inspect/#remote-debugging，勾选 "Allow remote debugging for this browser instance"');
       return { proceed: false, exitCode: 1 };
     }
   }
@@ -242,7 +228,7 @@ async function main() {
 
   // 先复用服务，避免调试端口文件缺失或未设置偏好阻断现有连接。
   const health = await httpGetJson(HEALTH_URL);
-  let browserId = opts.browser || getConfiguredBrowserId();
+  let browserId = opts.browser || getConfiguredBrowser();
   if (health?.status !== 'ok') {
     const resolved = await resolveAndReport(opts.browser);
     if (!resolved.proceed) process.exit(resolved.exitCode);

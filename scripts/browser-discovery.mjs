@@ -1,48 +1,129 @@
-// 浏览器 CDP 端口发现 + 选择 - 单一职责模块
-// 被 check-deps.mjs 和 cdp-proxy.mjs 共享。
+// 浏览器身份 + 端口发现 + 选择 - 单一职责模块
+// 被 check-deps.mjs、cdp-proxy.mjs、proxy-maintenance.mjs、browser-probe.mjs 共享。
+//
+// 浏览器身份 = 规范化后的用户数据目录绝对路径（浏览器把 DevToolsActivePort 写在它的根部）。
+// 不维护浏览器名单：任何 Chromium 内核浏览器给出数据目录即可使用。
+// 旧值 chrome / chrome-canary / chromium / edge 按平台对应到标准目录，只为兼容老配置，不再扩充。
+// 显示名取路径里最有辨识度的文件夹名，只用于展示，不参与身份比较。
 //
 // 选择规则（resolution）：
-//   1. 调用方传入 override 参数（来自命令行 --browser） → 严格模式，找不到则硬错
-//   2. config.env 里 WEB_ACCESS_BROWSER 设了 → 严格模式，找不到则硬错
-//   3. 都没设 → "ask" 模式，提示调用方询问用户
+//   1. 调用方传入 override（来自命令行 --browser，单次有效）
+//   2. config.env 的 WEB_ACCESS_BROWSER（持久）
+//   3. 都没设 → unset，由调用方引导首次配置（见 browser-probe.mjs）；不扫描目录、不猜端口
 //
-// 不擅自降级：偏好不可用一律硬错，让用户介入。
-// 持久态只有 config.env 一处（~/.web-access/config.env，见 user-data.mjs）；override 是单次 spawn 通过命令行参数表达，不读 process.env。
+// 只读所选目录的 DevToolsActivePort，并只做 TCP 探测（不建 WebSocket，不触发授权弹窗）。
+// 不擅自降级：所选浏览器不可用一律硬错，不换浏览器、不扫描固定端口。
+// 持久态只有 config.env 一处（~/.web-access/config.env，见 user-data.mjs）；override 只走命令行参数，不读 process.env。
 
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { userDataPaths } from './user-data.mjs';
 
-// 已知支持 chrome://inspect#remote-debugging toggle 的浏览器
-// 加新浏览器：只改这里
-export function knownBrowsers() {
+const PROBE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'browser-probe.mjs');
+
+export const INSPECT_HINT = '地址栏打开 chrome://inspect/#remote-debugging（Edge 为 edge://inspect/#remote-debugging），' +
+  '勾选 "Allow remote debugging for this browser instance"';
+
+// 旧配置值 → 标准数据目录（路径事实见 Chromium user_data_dir.md 与微软 Edge 文档）
+function legacyDataDir(value) {
+  const alias = value.toLowerCase();
   const home = os.homedir();
-  const localAppData = process.env.LOCALAPPDATA || '';
+  let dirs;
   switch (os.platform()) {
-    case 'darwin':
-      return [
-        { id: 'chrome',        label: 'Chrome',         devToolsPath: path.join(home, 'Library/Application Support/Google/Chrome/DevToolsActivePort') },
-        { id: 'chrome-canary', label: 'Chrome Canary',  devToolsPath: path.join(home, 'Library/Application Support/Google/Chrome Canary/DevToolsActivePort') },
-        { id: 'chromium',      label: 'Chromium',       devToolsPath: path.join(home, 'Library/Application Support/Chromium/DevToolsActivePort') },
-        { id: 'edge',          label: 'Microsoft Edge', devToolsPath: path.join(home, 'Library/Application Support/Microsoft Edge/DevToolsActivePort') },
-      ];
-    case 'linux':
-      return [
-        { id: 'chrome',   label: 'Chrome',         devToolsPath: path.join(home, '.config/google-chrome/DevToolsActivePort') },
-        { id: 'chromium', label: 'Chromium',       devToolsPath: path.join(home, '.config/chromium/DevToolsActivePort') },
-        { id: 'edge',     label: 'Microsoft Edge', devToolsPath: path.join(home, '.config/microsoft-edge/DevToolsActivePort') },
-      ];
-    case 'win32':
-      return [
-        { id: 'chrome',   label: 'Chrome',         devToolsPath: path.join(localAppData, 'Google/Chrome/User Data/DevToolsActivePort') },
-        { id: 'chromium', label: 'Chromium',       devToolsPath: path.join(localAppData, 'Chromium/User Data/DevToolsActivePort') },
-        { id: 'edge',     label: 'Microsoft Edge', devToolsPath: path.join(localAppData, 'Microsoft/Edge/User Data/DevToolsActivePort') },
-      ];
+    case 'darwin': {
+      const base = path.join(home, 'Library', 'Application Support');
+      dirs = {
+        chrome: path.join(base, 'Google', 'Chrome'),
+        'chrome-canary': path.join(base, 'Google', 'Chrome Canary'),
+        chromium: path.join(base, 'Chromium'),
+        edge: path.join(base, 'Microsoft Edge'),
+      };
+      break;
+    }
+    case 'linux': {
+      const base = path.join(home, '.config');
+      dirs = {
+        chrome: path.join(base, 'google-chrome'),
+        'chrome-canary': path.join(base, 'google-chrome-canary'),
+        chromium: path.join(base, 'chromium'),
+        edge: path.join(base, 'microsoft-edge'),
+      };
+      break;
+    }
+    case 'win32': {
+      const local = process.env.LOCALAPPDATA;
+      dirs = {
+        chrome: ['Google', 'Chrome', 'User Data'],
+        'chrome-canary': ['Google', 'Chrome SxS', 'User Data'],
+        chromium: ['Chromium', 'User Data'],
+        edge: ['Microsoft', 'Edge', 'User Data'],
+      };
+      if (!Object.hasOwn(dirs, alias)) return null;
+      if (!local) throw new Error(`旧配置值 ${alias} 需要环境变量 LOCALAPPDATA，当前未设置`);
+      return path.join(local, ...dirs[alias]);
+    }
     default:
-      return [];
+      return null;
   }
+  return Object.hasOwn(dirs, alias) ? dirs[alias] : null;
+}
+
+// 展开用户写法：去掉成对引号、展开 ~，Windows 另展开 %LOCALAPPDATA% / %APPDATA%。不判断是否绝对路径。
+export function expandPath(raw) {
+  let value = String(raw).trim().replace(/^(["'])(.*)\1$/, '$2').trim();
+  if (value === '~' || value.startsWith('~/') || (os.platform() === 'win32' && value.startsWith('~\\'))) {
+    value = path.join(os.homedir(), value.slice(1));
+  }
+  if (os.platform() === 'win32') {
+    value = value.replace(/%(LOCALAPPDATA|APPDATA)%/gi, (_match, name) => {
+      const expanded = process.env[name.toUpperCase()];
+      if (!expanded) throw new Error(`环境变量 ${name.toUpperCase()} 未设置，无法展开 ${raw}`);
+      return expanded;
+    });
+  }
+  return value;
+}
+
+// 配置值（数据目录路径或旧值）→ 浏览器 { id: 数据目录绝对路径, label: 显示名 }。无效值抛出可直接展示的错误。
+export function resolveBrowser(raw) {
+  const value = String(raw ?? '').trim();
+  if (!value) throw new Error('浏览器配置为空');
+  const legacy = legacyDataDir(value.replace(/^(["'])(.*)\1$/, '$2').trim());
+  const expanded = legacy || expandPath(value);
+  if (!path.isAbsolute(expanded)) {
+    throw new Error(`"${value}" 既不是浏览器数据目录的绝对路径，也不是旧配置值（chrome / chrome-canary / chromium / edge）`);
+  }
+  const id = path.resolve(expanded);
+  return { id, label: displayName(id) };
+}
+
+// 显示名：从路径末尾跳过通用的 `User Data` 层，取第一个文件夹名（Dia/User Data → Dia，Google/Chrome → Chrome）
+export function displayName(dataDir) {
+  const parts = String(dataDir).split(/[\\/]+/).filter(Boolean);
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (parts[i].toLowerCase() !== 'user data') return parts[i];
+  }
+  return String(dataDir);
+}
+
+// 两个配置值 / 运行中实例的 browser.id 是否指同一浏览器。旧值与其标准路径视为同一个；无法解析（如旧版 unknown）不相等。
+export function sameBrowser(a, b) {
+  let left;
+  let right;
+  try {
+    left = resolveBrowser(a).id;
+    right = resolveBrowser(b).id;
+  } catch { return false; }
+  return left === right;
+}
+
+// 展示用：能解析就给显示名，否则原样返回
+export function browserLabel(value) {
+  try { return resolveBrowser(value).label; }
+  catch { return String(value); }
 }
 
 // TCP 端口监听检测
@@ -54,6 +135,24 @@ export function checkPort(port, host = '127.0.0.1', timeoutMs = 2000) {
     socket.once('connect', () => { clearTimeout(timer); socket.destroy(); resolve(true); });
     socket.once('error',   () => { clearTimeout(timer); resolve(false); });
   });
+}
+
+// 读数据目录根部的 DevToolsActivePort（第 1 行端口，第 2 行 wsPath）。只读这一个文件。
+// 返回 { port, wsPath } 或 { reason, code? }，reason ∈ missing-dir | not-enabled | unreadable | invalid
+export function readActivePort(dataDir) {
+  const file = path.join(dataDir, 'DevToolsActivePort');
+  let content;
+  try { content = fs.readFileSync(file, 'utf8'); }
+  catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      return { reason: fs.existsSync(dataDir) ? 'not-enabled' : 'missing-dir' };
+    }
+    return { reason: 'unreadable', code: error.code || 'EIO' };
+  }
+  const lines = content.trim().split(/\r?\n/).filter(Boolean);
+  const port = Number(lines[0]);
+  if (!/^\d+$/.test(lines[0] || '') || port < 1 || port > 65535) return { reason: 'invalid' };
+  return { port, wsPath: lines[1] || null };
 }
 
 // 读 config.env 文件（不写入 process.env，分清来源）
@@ -75,85 +174,90 @@ function readConfig() {
   return cfg;
 }
 
-// 读取偏好无需探测浏览器；已有 Proxy 的连接状态由 /health 说明。
-export function getConfiguredBrowserId() {
+// 读取偏好原值（路径或旧值）无需探测浏览器；已有 Proxy 的连接状态由 /health 说明。
+export function getConfiguredBrowser() {
   return readConfig().WEB_ACCESS_BROWSER || null;
-}
-
-// 显式端口只绑定已配置的浏览器，不能被另一个浏览器的 override 借用。
-async function detectAll(browsers, configuredEndpoint) {
-  const detected = [];
-  const inaccessible = [];
-  for (const browser of browsers) {
-    if (configuredEndpoint?.id === browser.id) {
-      if (await checkPort(configuredEndpoint.port)) {
-        detected.push({ ...browser, port: configuredEndpoint.port, wsPath: null, endpointSource: 'config-port' });
-      }
-      continue;
-    }
-    let content;
-    try { content = fs.readFileSync(browser.devToolsPath, 'utf8'); }
-    catch (error) {
-      if (error.code === 'EPERM' || error.code === 'EACCES') {
-        inaccessible.push({ ...browser, code: error.code });
-      }
-      continue;
-    }
-    const lines = content.trim().split(/\r?\n/).filter(Boolean);
-    const port = parseInt(lines[0], 10);
-    if (!(port > 0 && port < 65536)) continue;
-    if (!(await checkPort(port))) continue;
-    detected.push({ ...browser, port, wsPath: lines[1] || null });
-  }
-  return { detected, inaccessible };
 }
 
 // 决策入口
 // 参数：override — 调用方解析自命令行 --browser 的值（null 表示未传）
-// 返回 { kind, browser?, source?, detected, configured, override?, inaccessible, message? }
-//   kind ∈ 'ok' | 'ambiguous' | 'mismatch' | 'empty' | 'config-error'
-//   source ∈ 'override' | 'preference' | undefined
-//   ambiguous = 没设偏好 + 至少一个浏览器开了 toggle，需问用户
-//   mismatch  = override/配偏好设了但未检测到对应 toggle，硬错
-//   empty     = 0 浏览器开 toggle 且未设偏好/override
+// 返回 { kind, browser?, source?, override?, reason?, code?, port?, message? }
+//   kind ∈ 'ok' | 'unavailable' | 'unset' | 'config-error'
+//   ok          = 所选浏览器端口在监听；browser 含 { id, label, port, wsPath, endpointSource? }
+//   unavailable = 所选浏览器连不上（reason 同 readActivePort，另有 offline = 端口未监听），硬错
+//   unset       = 没有偏好也没有 override，需要首次配置
+//   source ∈ 'override' | 'preference'
 export async function selectBrowser(override = null) {
   const config = readConfig();
   const configured = config.WEB_ACCESS_BROWSER || null;
-  const browsers = knownBrowsers();
+
+  // 显式端口只绑定已配置的浏览器，不能被另一个浏览器的 override 借用。
   let configuredEndpoint = null;
   if (config.WEB_ACCESS_CDP_PORT) {
     const rawPort = config.WEB_ACCESS_CDP_PORT;
     const port = Number(rawPort);
-    let message;
-    if (!configured) message = 'WEB_ACCESS_CDP_PORT 必须与 WEB_ACCESS_BROWSER 一起配置';
-    else if (!browsers.some(browser => browser.id === configured)) {
-      message = `WEB_ACCESS_CDP_PORT 绑定的浏览器 "${configured}" 不在当前平台的支持列表中`;
-    } else if (!/^\d+$/.test(rawPort) || port < 1 || port > 65535) {
-      message = 'WEB_ACCESS_CDP_PORT 必须是 1 到 65535 的十进制整数';
+    if (!configured) return configError('WEB_ACCESS_CDP_PORT 必须与 WEB_ACCESS_BROWSER 一起配置');
+    if (!/^\d+$/.test(rawPort) || port < 1 || port > 65535) {
+      return configError('WEB_ACCESS_CDP_PORT 必须是 1 到 65535 的十进制整数');
     }
-    if (message) return { kind: 'config-error', message, detected: [], configured, inaccessible: [] };
-    configuredEndpoint = { id: configured, port };
-  }
-  const { detected, inaccessible } = await detectAll(browsers, configuredEndpoint);
-  const facts = { detected, configured, inaccessible };
-
-  // 1. 命令行 override（最高优先，单次有效）
-  if (override) {
-    const match = detected.find(b => b.id === override);
-    if (match) return { kind: 'ok', browser: match, source: 'override', ...facts, override };
-    return { kind: 'mismatch', source: 'override', ...facts, override };
+    try { configuredEndpoint = { id: resolveBrowser(configured).id, port }; }
+    catch (error) { return configError(`WEB_ACCESS_BROWSER 的值无效：${error.message}`); }
   }
 
-  // 2. config.env preference（持久）
-  if (configured) {
-    const match = detected.find(b => b.id === configured);
-    if (match) return { kind: 'ok', browser: match, source: 'preference', ...facts };
-    return { kind: 'mismatch', source: 'preference', ...facts };
+  const raw = override || configured;
+  if (!raw) return { kind: 'unset' };
+  const source = override ? 'override' : 'preference';
+  let browser;
+  try { browser = resolveBrowser(raw); }
+  catch (error) {
+    return configError(`${override ? '--browser' : 'WEB_ACCESS_BROWSER'} 的值无效：${error.message}`);
+  }
+  const facts = { browser, source, ...(override ? { override } : {}) };
+
+  if (configuredEndpoint?.id === browser.id) {
+    const { port } = configuredEndpoint;
+    if (!(await checkPort(port))) return { kind: 'unavailable', ...facts, reason: 'offline', port, endpointSource: 'config-port' };
+    return { kind: 'ok', ...facts, browser: { ...browser, port, wsPath: null, endpointSource: 'config-port' } };
   }
 
-  // 3. 无偏好 —— 一律询问用户（哪怕 detected 只有一个）
-  if (detected.length === 0) {
-    return { kind: 'empty', ...facts };
+  const active = readActivePort(browser.id);
+  if (!active.port) return { kind: 'unavailable', ...facts, ...active };
+  if (!(await checkPort(active.port))) return { kind: 'unavailable', ...facts, reason: 'offline', port: active.port };
+  return { kind: 'ok', ...facts, browser: { ...browser, port: active.port, wsPath: active.wsPath } };
+}
+
+function configError(message) {
+  return { kind: 'config-error', message };
+}
+
+// 把 unavailable 结果解释为给 Agent 的处理步骤（check-deps 逐行打印，Proxy 合并为一条错误）
+export function explainUnavailable(result) {
+  const { browser, reason } = result;
+  const config = userDataPaths().config;
+  const who = `${result.source === 'override' ? '本次指定' : '默认偏好'}的浏览器 ${browser.label}（${browser.id}）`;
+  if (reason === 'missing-dir') {
+    return [
+      `${who} 的数据目录不存在`,
+      `请核对 WEB_ACCESS_BROWSER 或 --browser 的路径，可用 node "${PROBE_SCRIPT}" <文件夹> 重新确认；不会改用其他浏览器`,
+    ];
   }
-  return { kind: 'ambiguous', ...facts };
+  if (reason === 'unreadable') {
+    return [
+      `无法读取 ${browser.label} 的调试端口文件（${result.code}）：${path.join(browser.id, 'DevToolsActivePort')}`,
+      `请允许当前工具读取该文件，或在 ${config} 为 WEB_ACCESS_BROWSER 设置已核对的 WEB_ACCESS_CDP_PORT；不会猜测端口或切换浏览器`,
+    ];
+  }
+  const detail = {
+    'not-enabled': '数据目录里没有 DevToolsActivePort（浏览器未运行，或远程调试开关未开启）',
+    invalid: 'DevToolsActivePort 内容无效',
+    offline: result.endpointSource === 'config-port'
+      ? `WEB_ACCESS_CDP_PORT=${result.port} 未在监听`
+      : `DevToolsActivePort 记录的端口 ${result.port} 未在监听（浏览器已退出或开关已关闭）`,
+  }[reason] || reason;
+  return [
+    `${who} 没连上：${detail}`,
+    'Agent 处理顺序：',
+    `  1. 先用系统命令打开 ${browser.label}（按平台自行选择，如 macOS 的 open -a），再重试`,
+    `  2. 若仍失败，多半是远程调试开关没启用 —— 告诉用户：在 ${browser.label} 的${INSPECT_HINT}`,
+  ];
 }
