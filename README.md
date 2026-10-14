@@ -31,22 +31,31 @@ AI Agent 原本的联网能力（WebSearch、WebFetch）缺少调度策略和浏
 
 ---
 
-## v2.5.4 能力
+## v2.6.0 能力
 
 | 能力 | 说明 |
 |------|------|
 | 联网工具自动选择 | WebSearch / WebFetch / curl / Jina / CDP，按场景自主判断，可任意组合 |
-| CDP Proxy 浏览器操作 | 直连用户日常浏览器（Chrome / Edge / Chromium 系），天然携带登录态，支持动态页面、交互操作、视频截帧 |
-| 三种点击方式 | `/click`（JS click）、`/clickAt`（CDP 真实鼠标事件）、`/setFiles`（文件上传） |
+| CDP Proxy 浏览器操作 | 直连用户日常浏览器（Chrome / Edge / Brave / Arc / Dia 等任意 Chromium 内核浏览器），天然携带登录态，支持动态页面、交互操作、视频截帧 |
+| 点击与 iframe | `/click`（JS click）、`/clickAt`（CDP 真实鼠标事件）、`/clickXY`（坐标点击，可点进跨站 iframe、不激活标签页）、`/setFiles`（文件上传）；`/frames` + `/eval?frame=` 读取跨站 iframe 内容 |
 | 本地浏览器书签/历史检索 | `find-url.mjs` 跨 Chrome / Edge 查询公网搜不到的目标（内部系统）或用户访问过的页面，支持关键词/时间窗/访问频度排序 |
 | 并行分治 | 多目标时分发子 Agent 并行执行，共享一个 Proxy，tab 级隔离 |
 | 站点经验积累 | 按域名存储操作经验（URL 模式、平台特征、已知陷阱），跨 session 复用 |
 | 媒体提取 | 从 DOM 直取图片/视频 URL，或对视频任意时间点截帧分析 |
 
-**v2.5.4 更新：**
+**v2.6.0 更新：**
+- **升级必读：用户数据移到 `~/.web-access/`** — 浏览器偏好和站点经验不再放在 Skill 目录里，之后任何方式升级都不会被覆盖。用 `npx skills` 从旧版本升级的，**升级前**按 [`references/migration-2.6.md`](references/migration-2.6.md) 先备份；git 与 Claude Code 插件安装会自动迁移
+- **任意 Chromium 内核浏览器可用** — `WEB_ACCESS_BROWSER` 改填浏览器的用户数据目录，Brave、Arc、Dia、Vivaldi、Opera 等都能用；旧值 `chrome` / `edge` 继续有效。首次配置时 Agent 只看应用数据目录最外层的文件夹名认出浏览器，再用 `browser-probe.mjs` 只进入认出的文件夹确认（思路来自 #173，感谢 @zhangweijian97）
+- **跨站 iframe** — `GET /frames` 列出页面 iframe，`/eval?frame=<frameId>` 在其中执行；`GET /clickXY` 按坐标真实点击，可点中跨站 iframe 且不激活标签页
+- **不再扫描 9222 等固定端口**；`/health` 的 `browser.id` 改为数据目录真实路径
+- **修复** — `proxy-maintenance.mjs stop/restart` 对真实服务报错、restart 不拉起新服务；并发维护误报；探测遇到无权限目录崩溃；迁移失败重试丢偏好
+
+<details><summary>v2.5.4 更新</summary>
+
 - **修复新标签页空白竞态** — `/new` 先创建 `about:blank` 并完成 CDP attach，再显式导航；不再把浏览器初始空白文档误判为目标页面
 - **目标内容就绪契约** — 导航成功或 `readyState` 完成不等于任务完成；遇到验证页、登录跳转和异步渲染时继续观察，直到目标内容出现或确认受阻
 - **完整 URL 安全传输** — `/new` 和 `/navigate` 从 v2.5.3 起使用 POST body 传 URL，查询参数中的 `&` 不再被错误切分
+</details>
 
 <details><summary>v2.5.2 更新</summary>
 
