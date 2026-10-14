@@ -563,3 +563,28 @@ test('restart 保留路径形式的原浏览器选择，数据目录不同则 co
   assert.equal(conflict.output.status, 'conflict');
   assert.equal(conflict.output.expectedBrowserId, dia);
 });
+
+// 两个维护者同时停止同一实例时，后到的 /shutdown 可能落在退出中的进程上被重置；
+// 这同样说明实例正在退出，应继续按旧身份观察，而不是报错退出（restart 也就不会漏掉启动）。
+for (const action of ['stop', 'restart']) {
+  test(`${action}：/shutdown 请求被退出中的实例重置时继续观察，不报 ECONNRESET`, async t => {
+    const f = await fixture(t);
+    let reset = false;
+    const proxy = await fakeProxy(t, {
+      onRequest({ req, server }) {
+        if (req.url !== '/shutdown') return false;
+        reset = true;
+        req.socket.destroy();
+        server.close();
+        server.closeAllConnections();
+        return true;
+      },
+    });
+    const result = await f.run(proxy.port, [action]);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.ok(reset);
+    assert.equal(result.output.status, action === 'stop' ? 'stopped' : 'ready');
+    const starts = (await f.events()).filter(event => event.action === 'startup');
+    assert.equal(starts.length, action === 'stop' ? 0 : 1);
+  });
+}

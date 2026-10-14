@@ -105,8 +105,9 @@ async function requestStop(port, health) {
       method: 'POST', body: { instanceId: health.instanceId },
     });
   } catch (error) {
-    // 另一维护者可能刚好停止了同一实例，后续仍只观察旧身份。
-    if (error.code !== 'ECONNREFUSED') throw error;
+    // 另一维护者可能刚好停止了同一实例（端口已释放为 ECONNREFUSED，退出途中为 ECONNRESET），
+    // 后续仍只观察旧身份；观察有界，不强停也不据此启动。
+    if (error.code !== 'ECONNREFUSED' && error.code !== 'ECONNRESET') throw error;
     return waitForDeparture(port, health.instanceId);
   }
   if (result.code === 409) {
