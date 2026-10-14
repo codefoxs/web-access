@@ -35,7 +35,7 @@ curl -s http://localhost:3456/health
 
 连接模块 `scripts/cdp-connection.mjs` 唯一拥有 socket、连接尝试和命令响应。`connect()` 从浏览器发现开始共享同一个 Promise；`send()` 只在已有连接发送，不隐式连接；`close()` 立即拒绝该连接的等待者。每个 socket 的事件只作用于它自己的连接上下文，失败会清空该连接的命令等待，后续请求可重试。模块同时支持原生 WebSocket（EventTarget）和 `ws`（EventEmitter）。服务端 HTTP 和标签页职责保留在 Proxy，浏览器选择保留在 discovery 模块。
 
-`config.env` 中可选的 `WEB_ACCESS_CDP_PORT` 明确绑定 `WEB_ACCESS_BROWSER`，用于端口文件受系统权限限制或固定端口的连接方式。留空使用文件发现，非空必须是十进制 `1..65535` 且浏览器受当前平台支持。显式映射须先核对浏览器归属；发现只检测 TCP，不建立授权握手。不同浏览器覆盖不借用此端口，离线也不回退。端口文件的 `EPERM/EACCES` 会作为权限事实报告，不能据此断言未开启调试。
+`~/.web-access/config.env` 中可选的 `WEB_ACCESS_CDP_PORT` 明确绑定 `WEB_ACCESS_BROWSER`，用于端口文件受系统权限限制或固定端口的连接方式。留空使用文件发现，非空必须是十进制 `1..65535` 且浏览器受当前平台支持。显式映射须先核对浏览器归属；发现只检测 TCP，不建立授权握手。不同浏览器覆盖不借用此端口，离线也不回退。端口文件的 `EPERM/EACCES` 会作为权限事实报告，不能据此断言未开启调试。
 
 ### GET /targets
 列出所有已打开的页面 tab。返回数组，每项含 `targetId`、`title`、`url`。

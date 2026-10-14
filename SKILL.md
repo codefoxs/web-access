@@ -26,12 +26,14 @@ node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 
 按脚本输出处理：
 - `exit 0` → 直接调用 Proxy API，不再手动启动或重启 Proxy
-- `exit 2` → 需询问用户偏好，写入 `${CLAUDE_SKILL_DIR}/config.env` 的 `WEB_ACCESS_BROWSER`
+- `exit 2` → 需询问用户偏好，写入 `~/.web-access/config.env` 的 `WEB_ACCESS_BROWSER`（实际路径见脚本输出）
 - `exit 1` → 按 stdout 错误信息处理。若提示包含「Agent 处理顺序」，按其步骤执行（如先用系统命令打开浏览器后重跑），自动可解则不打扰用户；仍失败再向用户求助
 
 支持参数 `--browser <chrome|edge>` 表达本次临时覆盖（不写 config.env）。
 
 若调试端口文件不可读，脚本会报告 `EPERM/EACCES`，不要当成浏览器未开启调试。可在 `config.env` 将已核对的 `WEB_ACCESS_CDP_PORT` 明确绑定到 `WEB_ACCESS_BROWSER`；端口归属由配置提供，不自动猜测。留空仍使用文件发现，另一浏览器的 `--browser` 不借用此端口。
+
+用户数据（`config.env` 与站点经验）位于用户目录下的 `~/.web-access/`（Windows 为 `%USERPROFILE%\.web-access\`），不在 skill 目录内，升级 skill 不受影响。旧版本存放在 skill 目录内的数据，由前置检查首次运行时自动复制过来，并输出一行 `user-data:` 说明。
 
 Proxy 是全体 Agent 共用的长驻服务。普通任务不因修改代码、连接等待或任务结束重启服务。维护和切换浏览器使用跨平台的 Node 命令（将路径替换为实际 skill 路径）：
 
@@ -180,7 +182,7 @@ curl -s "http://localhost:3456/close?target=ID"
 
 很多网站的链接包含会话相关的参数（如 token），这些参数是正常访问所必需的。提取 URL 时应保留完整地址，不要裁剪或省略参数。URL 通过 POST body 原样传入 `/new` 或 `/navigate`。
 
-> **v2.5.3 迁移提示**：若引用的站点经验文件（`references/site-patterns/*.md`）或其它脚本中仍含 `GET /new?url=...` 或 `/navigate?target=...&url=...` 的旧写法，调用会收到迁移指引。按 [`references/migration-2.5.3.md`](references/migration-2.5.3.md) 就地改写为 POST body 后再使用，并顺手把该站点经验文件更新掉。
+> **v2.5.3 迁移提示**：若引用的站点经验文件（`~/.web-access/site-patterns/*.md`）或其它脚本中仍含 `GET /new?url=...` 或 `/navigate?target=...&url=...` 的旧写法，调用会收到迁移指引。按 [`references/migration-2.5.3.md`](references/migration-2.5.3.md) 就地改写为 POST body 后再使用，并顺手把该站点经验文件更新掉。
 
 ### 媒体资源提取
 
@@ -256,7 +258,7 @@ Proxy 的自动清理只针对通过 `/new` 创建且闲置 15 分钟的标签�
 
 ## 站点经验
 
-操作中积累的特定网站经验，按域名存储在 `references/site-patterns/` 下。
+操作中积累的特定网站经验，按域名存储在 `~/.web-access/site-patterns/{domain}.md`，前置检查输出的 site-patterns 列表下方给出实际目录。
 
 确定目标网站后，如果前置检查输出的 site-patterns 列表中有匹配的站点，必须读取对应文件获取先验知识（平台特征、有效模式、已知陷阱）。经验内容标注了发现日期，当作可能有效的提示而非保证——如果按经验操作失败，回退通用模式并更新经验文件。
 
@@ -285,4 +287,4 @@ updated: 2026-03-19
 | 文件 | 何时加载 |
 |------|---------|
 | `references/cdp-api.md` | 需要 CDP API 详细参考、JS 提取模式、错误处理时 |
-| `references/site-patterns/{domain}.md` | 确定目标网站后，读取对应站点经验 |
+| `~/.web-access/site-patterns/{domain}.md` | 确定目标网站后，读取对应站点经验 |

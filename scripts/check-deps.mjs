@@ -5,7 +5,7 @@
 //   node check-deps.mjs                  默认行为：读 config.env 偏好
 //   node check-deps.mjs --browser edge   本次临时指定浏览器（不写 config.env）
 //
-// 持久偏好 → config.env (skill 根目录, gitignored)
+// 持久偏好 → ~/.web-access/config.env（用户数据目录，见 user-data.mjs）
 // 单次覆盖 → --browser 命令行参数（全链路 argv，不碰 process.env）
 
 import { spawn } from 'node:child_process';
@@ -14,12 +14,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { selectBrowser, knownBrowsers, findFallbackPort, getConfiguredBrowserId } from './browser-discovery.mjs';
+import { userDataPaths, migrateLegacyData } from './user-data.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROXY_SCRIPT = path.join(ROOT, 'scripts', 'cdp-proxy.mjs');
 const PROXY_PORT = Number(process.env.CDP_PROXY_PORT || 3456);
 const HEALTH_URL = `http://127.0.0.1:${PROXY_PORT}/health`;
-const CONFIG_PATH = path.join(ROOT, 'config.env');
+const USER_DATA = userDataPaths();
+const CONFIG_PATH = USER_DATA.config;
 const CONFIG_TEMPLATE = path.join(ROOT, 'templates', 'config.env.template');
 
 // --- 参数解析 ---
@@ -33,11 +35,28 @@ function parseArgs(argv) {
   return opts;
 }
 
+// --- 旧版本用户数据一次性迁移：失败不阻塞，旧文件仍在原处，下次重试 ---
+
+function migrateUserData() {
+  try {
+    const result = migrateLegacyData();
+    if (!result?.sources.length) return;
+    const parts = result.sources.map(({ from, config, patterns }) => {
+      const items = [config && 'config.env', patterns && `${patterns} 个站点经验文件`].filter(Boolean).join('、');
+      return `${items}（来自 ${from}）`;
+    });
+    console.log(`user-data: 已迁移 ${parts.join('；')} → ${result.dir}（旧文件保留未删）`);
+  } catch (error) {
+    console.log(`user-data: warn — 旧数据迁移到 ${USER_DATA.dir} 失败（${error.message}），旧文件仍在原处，下次运行重试`);
+  }
+}
+
 // --- 首次安装：从模板创建 config.env ---
 
 function ensureConfigExists() {
   if (fs.existsSync(CONFIG_PATH)) return;
   try {
+    fs.mkdirSync(USER_DATA.dir, { recursive: true });
     fs.copyFileSync(CONFIG_TEMPLATE, CONFIG_PATH);
     console.log(`config: 已从模板创建 ${CONFIG_PATH}`);
   } catch {
@@ -171,7 +190,7 @@ async function resolveAndReport(override) {
     case 'ambiguous': {
       console.log('browser: needs decision — 用户尚未在 config.env 设置偏好');
       printAvailableHint(result.detected);
-      console.log('  请询问用户：哪个浏览器作为 Agent 的默认？（写入 config.env 的 WEB_ACCESS_BROWSER）');
+      console.log(`  请询问用户：哪个浏览器作为 Agent 的默认？（写入 ${CONFIG_PATH} 的 WEB_ACCESS_BROWSER）`);
       console.log('  若仅本次使用，可重跑：node check-deps.mjs --browser <id>');
       return { proceed: false, exitCode: 2 };
     }
@@ -184,7 +203,7 @@ async function resolveAndReport(override) {
       if (denied) {
         console.log(`browser: 文件访问受限 — 无法读取 ${expectedLabel} 的调试端口文件（${denied.code}）`);
         console.log(`  路径：${denied.devToolsPath}`);
-        console.log('  请允许当前工具读取该文件，或在 config.env 为 WEB_ACCESS_BROWSER 设置已核对的 WEB_ACCESS_CDP_PORT；不会猜测端口或切换浏览器');
+        console.log(`  请允许当前工具读取该文件，或在 ${CONFIG_PATH} 为 WEB_ACCESS_BROWSER 设置已核对的 WEB_ACCESS_CDP_PORT；不会猜测端口或切换浏览器`);
         return { proceed: false, exitCode: 1 };
       }
       console.log(`browser: error — ${sourceDesc}的浏览器是 "${expected}" (${expectedLabel})，但没连上`);
@@ -193,7 +212,7 @@ async function resolveAndReport(override) {
       console.log(`    2. 若仍报相同错误，可能是因为远程调试开关没启用 —— 告诉用户：在 ${expectedLabel} 的地址栏访问 ${expected}://inspect/#remote-debugging，勾选 "Allow remote debugging for this browser instance"`);
       printAvailableHint(result.detected);
       if (result.source === 'preference') {
-        console.log(`  也可以编辑 config.env 改默认偏好，或本次临时换浏览器：node check-deps.mjs --browser <id>`);
+        console.log(`  也可以编辑 ${CONFIG_PATH} 改默认偏好，或本次临时换浏览器：node check-deps.mjs --browser <id>`);
       }
       return { proceed: false, exitCode: 1 };
     }
@@ -201,7 +220,7 @@ async function resolveAndReport(override) {
     case 'empty': {
       if (result.inaccessible?.length) {
         console.log(`browser: 文件访问受限 — ${result.inaccessible.map(b => `${b.label} (${b.code})`).join('、')}`);
-        console.log('  请允许当前工具读取调试端口文件，或在 config.env 明确配置 WEB_ACCESS_BROWSER 与已核对的 WEB_ACCESS_CDP_PORT');
+        console.log(`  请允许当前工具读取调试端口文件，或在 ${CONFIG_PATH} 明确配置 WEB_ACCESS_BROWSER 与已核对的 WEB_ACCESS_CDP_PORT`);
         return { proceed: false, exitCode: 1 };
       }
       // 末路兜底：尝试常见固定端口（用户手动 --remote-debugging-port=9222 启动的场景）
@@ -222,6 +241,7 @@ async function resolveAndReport(override) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  migrateUserData(); // 先迁移，避免模板创建的空 config.env 挡住旧偏好
   ensureConfigExists();
   checkNode();
 
@@ -237,16 +257,15 @@ async function main() {
   const proxyOk = await ensureProxy(browserId, opts.browser, health);
   if (!proxyOk) process.exit(1);
 
-  // 列出已有站点经验
-  const patternsDir = path.join(ROOT, 'references', 'site-patterns');
+  // 列出已有站点经验，附目录路径供 Agent 读写
+  let sites = [];
   try {
-    const sites = fs.readdirSync(patternsDir)
+    sites = fs.readdirSync(USER_DATA.sitePatterns)
       .filter(f => f.endsWith('.md'))
       .map(f => f.replace(/\.md$/, ''));
-    if (sites.length) {
-      console.log(`\nsite-patterns: ${sites.join(', ')}`);
-    }
   } catch {}
+  console.log(`\nsite-patterns: ${sites.length ? sites.join(', ') : '（暂无）'}`);
+  console.log(`  目录：${USER_DATA.sitePatterns}（文件名 {domain}.md）`);
 }
 
 await main();

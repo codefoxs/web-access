@@ -11,6 +11,7 @@ import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { createCdpConnection } from './cdp-connection.mjs';
 import { selectBrowser, findFallbackPort } from './browser-discovery.mjs';
+import { userDataPaths } from './user-data.mjs';
 
 // --- 解析命令行 --browser 参数（本次启动用哪个浏览器）---
 function parseBrowserArg() {
@@ -88,7 +89,7 @@ async function discoverChromePort() {
     const denied = result.inaccessible?.find(browser => browser.id === expected);
     if (denied) {
       throw new Error(`无法读取 ${denied.label} 的调试端口文件（${denied.code}）。` +
-        '请允许文件访问，或在 config.env 为 WEB_ACCESS_BROWSER 设置已核对的 WEB_ACCESS_CDP_PORT；不会猜测端口或切换浏览器。');
+        `请允许文件访问，或在 ${userDataPaths().config} 为 WEB_ACCESS_BROWSER 设置已核对的 WEB_ACCESS_CDP_PORT；不会猜测端口或切换浏览器。`);
     }
     const src = result.source === 'override' ? '本次指定' : '默认偏好';
     throw new Error(
@@ -99,7 +100,7 @@ async function discoverChromePort() {
   }
   if (result.inaccessible?.length) {
     throw new Error(`无法读取浏览器调试端口文件（${result.inaccessible.map(b => `${b.label}: ${b.code}`).join('、')}）。` +
-      '请允许文件访问，或在 config.env 明确配置 WEB_ACCESS_BROWSER 与已核对的 WEB_ACCESS_CDP_PORT。');
+      `请允许文件访问，或在 ${userDataPaths().config} 明确配置 WEB_ACCESS_BROWSER 与已核对的 WEB_ACCESS_CDP_PORT。`);
   }
   // 已 pin 过浏览器（如首次连上 edge 后 edge 退出）：拒绝任何 fallback
   if (pinnedBrowserId) {

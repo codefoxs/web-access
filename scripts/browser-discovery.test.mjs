@@ -18,9 +18,13 @@ async function fixture(t, { platform = 'darwin', config = '', envPreference = ''
   await fs.mkdir(scripts, { recursive: true });
   await fs.mkdir(home, { recursive: true });
   await fs.mkdir(localAppData, { recursive: true });
-  const configPath = path.join(root, 'config.env');
+  // 偏好位于（模拟的）HOME 下的用户数据目录，与 Skill 副本分离
+  const configPath = path.join(home, '.web-access', 'config.env');
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
   if (config !== null) await fs.writeFile(configPath, config);
-  await fs.copyFile(path.join(SCRIPTS, 'browser-discovery.mjs'), path.join(scripts, 'browser-discovery.mjs'));
+  for (const name of ['browser-discovery.mjs', 'user-data.mjs']) {
+    await fs.copyFile(path.join(SCRIPTS, name), path.join(scripts, name));
+  }
   const probe = path.join(root, 'probe.mjs');
   await fs.writeFile(probe, `
 import net from 'node:net';
@@ -52,7 +56,7 @@ fs.readFileSync = (filename, ...args) => {
 const discovery = await import(pathToFileURL(opts.modulePath));
 let result;
 if (opts.action === 'windowsPaths') {
-  // 模块级 Skill 根路径使用宿主路径；仅路径映射调用使用 Windows 原生分隔规则。
+  // 模块导入使用宿主路径；仅路径映射调用使用 Windows 原生分隔规则。
   path.join = path.win32.join;
   result = discovery.knownBrowsers();
 } else if (opts.action === 'known') {

@@ -9,18 +9,23 @@ import test from 'node:test';
 
 const SCRIPTS = path.dirname(fileURLToPath(import.meta.url));
 
-// 所有检查在脚本副本、临时配置和本地假服务上运行，不接触真实浏览器。
+// 所有检查在脚本副本、临时 HOME、临时配置和本地假服务上运行，不接触真实浏览器与真实用户数据。
 async function fixture(t, { configured = null } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'web-access-check-deps-'));
-  const scripts = path.join(root, 'scripts');
+  const skill = path.join(root, 'skill');
+  const home = path.join(root, 'home');
+  const scripts = path.join(skill, 'scripts');
   const temporary = path.join(root, 'tmp');
   const eventsPath = path.join(root, 'events.jsonl');
-  await fs.mkdir(scripts);
+  const configPath = path.join(home, '.web-access', 'config.env');
+  await fs.mkdir(scripts, { recursive: true });
   await fs.mkdir(temporary);
-  await fs.mkdir(path.join(root, 'templates'));
+  await fs.mkdir(path.join(skill, 'templates'));
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
   await fs.copyFile(path.join(SCRIPTS, 'check-deps.mjs'), path.join(scripts, 'check-deps.mjs'));
+  await fs.copyFile(path.join(SCRIPTS, 'user-data.mjs'), path.join(scripts, 'user-data.mjs'));
   await fs.copyFile(path.join(SCRIPTS, 'browser-discovery.mjs'), path.join(scripts, 'browser-discovery-real.mjs'));
-  await fs.writeFile(path.join(root, 'config.env'), configured ? `WEB_ACCESS_BROWSER=${configured}\n` : '');
+  await fs.writeFile(configPath, configured ? `WEB_ACCESS_BROWSER=${configured}\n` : '');
 
   // 只保留真实的偏好读取；发现浏览器与启动 Proxy 均记录副作用。
   await fs.writeFile(path.join(scripts, 'browser-discovery.mjs'), `
@@ -78,12 +83,17 @@ globalThis.setTimeout = (callback, delay, ...args) => originalSetTimeout(callbac
   });
   return {
     root,
+    skill,
+    home,
+    configPath,
     events,
     async run(port, args = []) {
       const child = spawn(process.execPath, ['--import', preload, path.join(scripts, 'check-deps.mjs'), ...args], {
         env: {
           ...process.env,
           CDP_PROXY_PORT: String(port),
+          HOME: home,
+          USERPROFILE: home,
           TEST_EVENTS_PATH: eventsPath,
           TMPDIR: temporary,
           TMP: temporary,
@@ -171,7 +181,7 @@ test('--browser 覆盖 config.env，并且不会改写持久偏好', async t => 
   const proxy = await fakeProxy(t);
   success(await f.run(proxy.port, ['--browser', 'chrome']));
   assert.deepEqual(await f.events(), []);
-  assert.equal(await fs.readFile(path.join(f.root, 'config.env'), 'utf8'), 'WEB_ACCESS_BROWSER=edge\n');
+  assert.equal(await fs.readFile(f.configPath, 'utf8'), 'WEB_ACCESS_BROWSER=edge\n');
 });
 
 for (const { name, configured, args } of [
@@ -280,4 +290,59 @@ test('没有服务时才发现浏览器并启动可在检查结束后继续运�
   const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
   assert.equal(health.connected, true);
   assert.equal(health.browser.id, 'edge');
+});
+
+test('旧版本 Skill 目录内的偏好与站点经验在启动早期迁到 HOME/.web-access 并生效', async t => {
+  const f = await fixture(t);
+  await fs.rm(f.configPath);
+  const legacyPatterns = path.join(f.skill, 'references', 'site-patterns');
+  await fs.mkdir(path.join(legacyPatterns, 'archive'), { recursive: true });
+  await fs.writeFile(path.join(f.skill, 'config.env'), 'WEB_ACCESS_BROWSER=edge\n');
+  await fs.writeFile(path.join(legacyPatterns, 'example.com.md'), '---\ndomain: example.com\n---\n');
+  await fs.writeFile(path.join(legacyPatterns, 'archive', 'old.com.md'), 'old');
+  const proxy = await fakeProxy(t, { browser: 'chrome' });
+  // 迁来的 edge 偏好必须被读取：与运行中的 Chrome 实例不一致而失败
+  const result = await f.run(proxy.port);
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(result.stdout, /浏览器不一致/);
+  const notice = result.stdout.split('\n').filter(line => line.startsWith('user-data:'));
+  assert.equal(notice.length, 1);
+  assert.ok(notice[0].includes('config.env') && notice[0].includes('2 个站点经验文件'), notice[0]);
+  assert.ok(notice[0].includes(f.skill) && notice[0].includes(path.join(f.home, '.web-access')), notice[0]);
+  assert.equal(await fs.readFile(f.configPath, 'utf8'), 'WEB_ACCESS_BROWSER=edge\n');
+  assert.equal(await fs.readFile(path.join(f.home, '.web-access', 'site-patterns', 'archive', 'old.com.md'), 'utf8'), 'old');
+  assert.equal(await fs.readFile(path.join(f.skill, 'config.env'), 'utf8'), 'WEB_ACCESS_BROWSER=edge\n');
+
+  // 第二次运行不再迁移；站点经验列表附带新目录
+  const edgeProxy = await fakeProxy(t, { browser: 'edge' });
+  const second = await f.run(edgeProxy.port);
+  success(second);
+  assert.doesNotMatch(second.stdout, /user-data:/);
+  assert.match(second.stdout, /site-patterns: example\.com/);
+  assert.ok(second.stdout.includes(path.join(f.home, '.web-access', 'site-patterns')), second.stdout);
+});
+
+test('没有旧数据时迁移静默，首次运行在新建的数据目录中从模板创建 config.env', async t => {
+  const f = await fixture(t);
+  await fs.rm(path.dirname(f.configPath), { recursive: true });
+  await fs.copyFile(path.join(SCRIPTS, '..', 'templates', 'config.env.template'), path.join(f.skill, 'templates', 'config.env.template'));
+  const proxy = await fakeProxy(t);
+  const result = await f.run(proxy.port);
+  success(result);
+  assert.doesNotMatch(result.stdout, /user-data:/);
+  assert.match(result.stdout, /site-patterns: （暂无）/);
+  assert.match(await fs.readFile(f.configPath, 'utf8'), /^WEB_ACCESS_BROWSER=$/m);
+  assert.deepEqual(await f.events(), []);
+});
+
+test('迁移失败只提示一行警告，不阻塞前置检查', async t => {
+  const f = await fixture(t);
+  await fs.rm(path.dirname(f.configPath), { recursive: true });
+  await fs.writeFile(path.dirname(f.configPath), '占位文件，使数据目录无法创建');
+  await fs.writeFile(path.join(f.skill, 'config.env'), 'WEB_ACCESS_BROWSER=chrome\n');
+  const proxy = await fakeProxy(t);
+  const result = await f.run(proxy.port);
+  success(result);
+  assert.equal(result.stdout.split('\n').filter(line => line.startsWith('user-data: warn')).length, 1);
+  assert.equal(await fs.readFile(path.join(f.skill, 'config.env'), 'utf8'), 'WEB_ACCESS_BROWSER=chrome\n');
 });

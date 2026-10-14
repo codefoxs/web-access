@@ -135,7 +135,7 @@ async function fixture(t, flags = {}) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'web-access-proxy-'));
   const scripts = path.join(root, 'scripts');
   await fsp.mkdir(scripts);
-  for (const name of ['cdp-proxy.mjs', 'cdp-connection.mjs']) {
+  for (const name of ['cdp-proxy.mjs', 'cdp-connection.mjs', 'user-data.mjs']) {
     await fsp.copyFile(path.join(SCRIPTS, name), path.join(scripts, name));
   }
   await fsp.writeFile(path.join(scripts, 'fake-runtime.mjs'), RUNTIME);

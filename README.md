@@ -116,6 +116,33 @@ claude plugin install web-access@web-access --scope user
 git clone https://github.com/eze-is/web-access ~/.claude/skills/web-access
 ```
 
+> [!IMPORTANT]
+> **升级说明（给 Agent 和用户）**
+>
+> 从本版本起，用户数据（浏览器偏好 `config.env`、站点经验 `site-patterns/`）存放在用户目录下的 `~/.web-access/`（Windows 为 `%USERPROFILE%\.web-access\`），不再放在 skill 目录内。
+>
+> - **用 `npx skills` 从旧版本升级**：`npx skills update` 会先删除整个 skill 目录再重装，旧版本的数据会随之丢失。**升级前**先把旧 skill 目录下的 `config.env` 和 `references/site-patterns/` 复制到 `~/.web-access/`，再执行升级。
+> - **git clone 或 Claude Code 插件安装**：升级后首次运行前置检查时自动复制旧数据（只复制、不删除、不覆盖已有文件），并输出一行 `user-data:` 说明，无需手动操作。
+> - 本版本之后，任何方式升级都不会再丢失这些数据。
+>
+> macOS / Linux（`SKILL_DIR` 换成旧版本 skill 的实际目录，如 `~/.claude/skills/web-access`、`~/.agents/skills/web-access`）：
+>
+> ```bash
+> SKILL_DIR=~/.claude/skills/web-access
+> mkdir -p ~/.web-access/site-patterns
+> [ -f "$SKILL_DIR/config.env" ] && cp -n "$SKILL_DIR/config.env" ~/.web-access/
+> cp -Rn "$SKILL_DIR/references/site-patterns/." ~/.web-access/site-patterns/
+> ```
+>
+> Windows（PowerShell）：
+>
+> ```powershell
+> $SkillDir = "$env:USERPROFILE\.claude\skills\web-access"
+> New-Item -ItemType Directory -Force "$env:USERPROFILE\.web-access\site-patterns" | Out-Null
+> if (Test-Path "$SkillDir\config.env") { Copy-Item "$SkillDir\config.env" "$env:USERPROFILE\.web-access\" }
+> Copy-Item "$SkillDir\references\site-patterns\*" "$env:USERPROFILE\.web-access\site-patterns\" -Recurse
+> ```
+
 ## 前置配置（CDP 模式）
 
 CDP 模式需要 **Node.js 22+** 和浏览器（Chrome / Edge）开启远程调试：
@@ -127,7 +154,7 @@ CDP 模式需要 **Node.js 22+** 和浏览器（Chrome / Edge）开启远程调�
 
 ### 浏览器偏好（config.env）
 
-skill 长期偏好保存在 `${CLAUDE_SKILL_DIR}/config.env`（首次运行自动从 `config.env.template` 创建，gitignored）：
+skill 长期偏好保存在 `~/.web-access/config.env`（Windows 为 `%USERPROFILE%\.web-access\config.env`；首次运行自动从 `templates/config.env.template` 创建）。它与站点经验 `~/.web-access/site-patterns/` 一起放在 skill 目录之外，升级 skill 不会覆盖或删除：
 
 ```bash
 # 留空 = 每次启动都询问偏好；设值 = 固定使用该浏览器

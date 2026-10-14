@@ -7,16 +7,13 @@
 //   3. 都没设 → "ask" 模式，提示调用方询问用户
 //
 // 不擅自降级：偏好不可用一律硬错，让用户介入。
-// 持久态只有 config.env 一处；override 是单次 spawn 通过命令行参数表达，不读 process.env。
+// 持久态只有 config.env 一处（~/.web-access/config.env，见 user-data.mjs）；override 是单次 spawn 通过命令行参数表达，不读 process.env。
 
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const SKILL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const CONFIG_PATH = path.join(SKILL_ROOT, 'config.env');
+import { userDataPaths } from './user-data.mjs';
 
 // 已知支持 chrome://inspect#remote-debugging toggle 的浏览器
 // 加新浏览器：只改这里
@@ -64,7 +61,7 @@ export function checkPort(port, host = '127.0.0.1', timeoutMs = 2000) {
 function readConfig() {
   const cfg = {};
   let content;
-  try { content = fs.readFileSync(CONFIG_PATH, 'utf8'); }
+  try { content = fs.readFileSync(userDataPaths().config, 'utf8'); }
   catch { return cfg; }
   for (const line of content.split(/\r?\n/)) {
     const t = line.trim();
