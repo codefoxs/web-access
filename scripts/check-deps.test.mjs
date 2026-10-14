@@ -26,8 +26,9 @@ function appDataRoot(f) {
 }
 
 // 所有检查在脚本副本、临时 HOME、临时配置和本地假服务上运行，不接触真实浏览器与真实用户数据。
-async function fixture(t, { configured = null } = {}) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'web-access-check-deps-'));
+async function fixture(t, { configured = null, dataDirs = true } = {}) {
+  // 取真实路径：浏览器身份按真实路径规范化（macOS 的临时目录经 /var → /private/var 软链接）
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'web-access-check-deps-')));
   const skill = path.join(root, 'skill');
   const home = path.join(root, 'home');
   const scripts = path.join(skill, 'scripts');
@@ -47,6 +48,14 @@ async function fixture(t, { configured = null } = {}) {
   await fs.copyFile(path.join(SCRIPTS, 'browser-probe.mjs'), path.join(scripts, 'browser-probe.mjs'));
   await fs.copyFile(path.join(SCRIPTS, 'browser-discovery.mjs'), path.join(scripts, 'browser-discovery-real.mjs'));
   await fs.writeFile(configPath, configured ? `WEB_ACCESS_BROWSER=${configured}\n` : '');
+  // 测试用到的浏览器数据目录（含 Local State），配置值才是有效的
+  if (dataDirs) {
+    const f = { home, localAppData };
+    for (const dir of [legacyDataDir(f, 'chrome'), legacyDataDir(f, 'edge'), path.join(home, 'Dia', 'User Data')]) {
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, 'Local State'), '{}');
+    }
+  }
 
   // 身份解析、偏好读取与提示文案用真实实现；只替换选择结果（可由 TEST_SELECT 指定），并记录调用。
   await fs.writeFile(path.join(scripts, 'browser-discovery.mjs'), `
@@ -224,7 +233,6 @@ for (const { name, configured, args } of [
 
 for (const { name, configured, args } of [
   { name: 'CLI 指定 Chrome', configured: null, args: ['--browser', 'chrome'] },
-  { name: 'CLI 浏览器名拼写错误', configured: null, args: ['--browser', 'chrmoe'] },
   { name: 'config.env 偏好', configured: 'chrome', args: [] },
 ]) {
   test(`已连接实例身份未知时不能满足 ${name}，失败并保留服务`, async t => {
@@ -378,7 +386,7 @@ async function unusedPort() {
 }
 
 test('未设置浏览器时 exit 2：列出应用数据根目录的最外层文件夹名与探测命令，不进入文件夹、不启动服务', async t => {
-  const f = await fixture(t);
+  const f = await fixture(t, { dataDirs: false });
   const root = appDataRoot(f);
   await fs.mkdir(path.join(root, 'Dia', 'User Data', 'NestedProfileMarker'), { recursive: true });
   await fs.mkdir(path.join(root, 'Google', 'Chrome'), { recursive: true });
@@ -446,4 +454,39 @@ test('没有服务时按配置的数据目录启动，Proxy 报告规范化路�
   assert.deepEqual(events.find(event => event.action === 'spawn').args, []);
   const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
   assert.deepEqual(health.browser, { id: path.join(f.home, 'Dia', 'User Data'), label: 'Dia' });
+});
+
+// 审查应修-3：值本身无效时，与共享服务是否在运行无关，先报配置错误，不引导停止共享服务。
+for (const { name, configured, args = [], setup, pattern } of [
+  { name: '只写文件夹名', configured: 'Dia', pattern: /既不是浏览器数据目录的绝对路径/ },
+  { name: '相对路径', configured: 'Google/Chrome', pattern: /既不是浏览器数据目录的绝对路径/ },
+  { name: 'CLI 浏览器名拼写错误', args: ['--browser', 'chrmoe'], pattern: /--browser 的值无效/ },
+  { name: '目录不存在', configured: '~/NoSuch/User Data', pattern: /不存在或不是文件夹/ },
+  { name: '不是 Chromium 数据目录', configured: '~/Dia', pattern: /没有 Local State/ },
+]) {
+  for (const running of [true, false]) {
+    test(`配置值无效（${name}）时${running ? '即使共享服务在运行也' : ''}先报配置错误，不提示停止服务`, async t => {
+      const f = await fixture(t, { configured });
+      const port = running ? (await fakeProxy(t, { browser: 'chrome' })).port : await unusedPort();
+      const result = await f.run(port, args);
+      assert.equal(result.code, 1, result.stderr);
+      assert.match(result.stdout, /browser: 配置错误 — /);
+      assert.match(result.stdout, pattern);
+      assert.match(result.stdout, /含 Local State 的那一层/);
+      assert.match(result.stdout, /不需要停止或重启共享服务/);
+      assert.doesNotMatch(result.stdout, /浏览器不一致|proxy-maintenance\.mjs stop/);
+      assert.deepEqual(await f.events(), []);
+    });
+  }
+}
+
+test('经软链接写的数据目录与运行实例报告的真实路径视为同一浏览器', async t => {
+  const f = await fixture(t);
+  const link = path.join(f.root, 'links', 'chrome');
+  await fs.mkdir(path.dirname(link), { recursive: true });
+  await fs.symlink(legacyDataDir(f, 'chrome'), link);
+  await fs.writeFile(f.configPath, `WEB_ACCESS_BROWSER=${link}\n`);
+  const proxy = await fakeProxy(t, { browser: legacyDataDir(f, 'chrome') });
+  success(await f.run(proxy.port));
+  assert.deepEqual(await f.events(), []);
 });

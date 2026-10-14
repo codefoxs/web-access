@@ -67,7 +67,8 @@ console.log(JSON.stringify({ result, ...globalThis.__testRecord }));
 `;
 
 async function fixture(t, { platform = 'darwin', config = '' } = {}) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'Web Access discovery with spaces '));
+  // 取真实路径：浏览器身份按真实路径规范化（macOS 的临时目录经 /var → /private/var 软链接）
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'Web Access discovery with spaces ')));
   const scripts = path.join(root, 'scripts');
   const home = path.join(root, 'User Name', 'Home Directory');
   const localAppData = path.join(root, 'User Name', 'AppData', 'Local Data');
@@ -336,17 +337,36 @@ for (const config of [null, '# 注释\r\nWEB_ACCESS_BROWSER=\r\n', `# 注释\r\n
   });
 }
 
-test('所选数据目录不存在时 unavailable(missing-dir)，不发 TCP、不改用其他已开调试的浏览器', async t => {
-  const f = await fixture(t, { config: `WEB_ACCESS_BROWSER=~/${DIA}\n` });
-  const server = await fakeHttp(t);
-  await f.dataDir(legacyPaths.darwin.chrome[0], `${server.port}\n/chrome\n`);
-  const { result, connections, readdirs } = await f.run('select', { rejectTcp: true });
-  assert.equal(result.kind, 'unavailable');
-  assert.equal(result.reason, 'missing-dir');
-  assert.equal(result.source, 'preference');
-  assert.equal(result.browser.label, 'Dia');
-  assert.equal(connections, 0);
-  assert.deepEqual(readdirs, []);
+for (const { name, setup, pattern } of [
+  { name: '数据目录不存在', setup: async () => {}, pattern: /不存在或不是文件夹/ },
+  { name: '目录里没有 Local State', setup: f => fs.mkdir(path.join(f.home, DIA), { recursive: true }), pattern: /没有 Local State/ },
+]) {
+  test(`所选值${name}时是配置错误，不发 TCP、不改用其他已开调试的浏览器`, async t => {
+    const f = await fixture(t, { config: `WEB_ACCESS_BROWSER=~/${DIA}\n` });
+    const server = await fakeHttp(t);
+    await f.dataDir(legacyPaths.darwin.chrome[0], `${server.port}\n/chrome\n`);
+    await setup(f);
+    const { result, connections, readdirs } = await f.run('select', { rejectTcp: true });
+    assert.equal(result.kind, 'config-error');
+    assert.match(result.message, /^WEB_ACCESS_BROWSER 的值无效/);
+    assert.match(result.message, pattern);
+    assert.equal(connections, 0);
+    assert.deepEqual(readdirs, []);
+  });
+}
+
+test('身份按真实路径规范化：软链接与大小写不同的写法指向同一目录时视为同一浏览器', async t => {
+  const f = await fixture(t);
+  const dia = await f.dataDir(DIA);
+  const link = path.join(f.home, 'links', 'dia');
+  await fs.mkdir(path.dirname(link), { recursive: true });
+  await fs.symlink(dia, link);
+  assert.equal((await f.run('resolve', { value: link })).result.id, dia);
+  assert.equal((await f.run('same', { a: link, b: `~/${DIA}` })).result, true);
+  // 大小写不敏感的文件系统（macOS 默认 APFS、Windows）上，不同大小写写法也归一
+  const upper = path.join(f.home, DIA.toUpperCase());
+  const caseInsensitive = await fs.access(upper).then(() => true, () => false);
+  if (caseInsensitive) assert.equal((await f.run('same', { a: upper, b: dia })).result, true);
 });
 
 test('目录存在但没有端口文件时 unavailable(not-enabled)', async t => {
@@ -406,7 +426,7 @@ test('override 值无效时配置错误并点名 --browser，不回退到配置�
 test('显式端口与配置浏览器绑定，跳过其不可读文件且仅建立 TCP', async t => {
   const server = await fakeHttp(t);
   const f = await fixture(t, { config: `WEB_ACCESS_BROWSER=~/${DIA}\r\nWEB_ACCESS_CDP_PORT=${server.port}\r\n` });
-  const dir = path.join(f.home, DIA);
+  const dir = await f.dataDir(DIA);
   const { result, connections, reads } = await f.run('select', { deniedPaths: { [path.join(dir, 'DevToolsActivePort')]: 'EPERM' } });
   assert.equal(result.kind, 'ok');
   assert.deepEqual(result.browser, { id: dir, label: 'Dia', port: server.port, wsPath: null, endpointSource: 'config-port' });
@@ -418,7 +438,7 @@ test('显式端口与配置浏览器绑定，跳过其不可读文件且仅建�
 test('显式端口按身份绑定：配置旧值 chrome、override 写标准路径时仍使用该端口', async t => {
   const server = await fakeHttp(t);
   const f = await fixture(t, { config: `WEB_ACCESS_BROWSER=chrome\nWEB_ACCESS_CDP_PORT=${server.port}\n` });
-  const chrome = path.join(f.home, legacyPaths.darwin.chrome[0]);
+  const chrome = await f.dataDir(legacyPaths.darwin.chrome[0]);
   const { result } = await f.run('select', { override: `${chrome}/` });
   assert.equal(result.kind, 'ok');
   assert.equal(result.source, 'override');
@@ -442,6 +462,7 @@ test('override 其它浏览器只使用自己的端口文件，不借用显式�
 test('override 浏览器不可用时 unavailable，已配置的显式端口不成为兜底', async t => {
   const server = await fakeHttp(t);
   const f = await fixture(t, { config: `WEB_ACCESS_BROWSER=chrome\nWEB_ACCESS_CDP_PORT=${server.port}\n` });
+  await f.dataDir(DIA);
   const { result, connections } = await f.run('select', { override: `~/${DIA}` });
   assert.equal(result.kind, 'unavailable');
   assert.equal(result.source, 'override');
@@ -521,9 +542,9 @@ test('不可用提示使用显示名与通用 inspect 地址，并注明 Edge �
   assert.ok(notEnabled.includes('chrome://inspect/#remote-debugging'));
   assert.ok(notEnabled.includes('edge://inspect/#remote-debugging'));
   assert.doesNotMatch(notEnabled, /dia:\/\/|\/Users\/u\/Library\/Application Support\/Dia\/User Data:\/\//);
-  const missing = (await f.run('explain', { result: { kind: 'unavailable', browser, source: 'override', reason: 'missing-dir' } })).result.join('\n');
-  assert.match(missing, /本次指定的浏览器 Dia/);
-  assert.match(missing, /browser-probe\.mjs/);
+  const offline = (await f.run('explain', { result: { kind: 'unavailable', browser, source: 'override', reason: 'offline', port: 1234 } })).result.join('\n');
+  assert.match(offline, /本次指定的浏览器 Dia/);
+  assert.match(offline, /端口 1234 未在监听/);
   const denied = (await f.run('explain', { result: { kind: 'unavailable', browser, source: 'preference', reason: 'unreadable', code: 'EPERM' } })).result.join('\n');
   assert.match(denied, /EPERM/);
   assert.match(denied, /WEB_ACCESS_CDP_PORT/);

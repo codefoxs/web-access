@@ -1,7 +1,8 @@
 // 浏览器身份 + 端口发现 + 选择 - 单一职责模块
 // 被 check-deps.mjs、cdp-proxy.mjs、proxy-maintenance.mjs、browser-probe.mjs 共享。
 //
-// 浏览器身份 = 规范化后的用户数据目录绝对路径（浏览器把 DevToolsActivePort 写在它的根部）。
+// 浏览器身份 = 规范化后的用户数据目录绝对路径（浏览器把 DevToolsActivePort 写在它的根部）；
+// 目录存在时取真实路径，软链接、macOS / Windows 的大小写差异都归一到同一身份。
 // 不维护浏览器名单：任何 Chromium 内核浏览器给出数据目录即可使用。
 // 旧值 chrome / chrome-canary / chromium / edge 按平台对应到标准目录，只为兼容老配置，不再扩充。
 // 显示名取路径里最有辨识度的文件夹名，只用于展示，不参与身份比较。
@@ -19,10 +20,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { userDataPaths } from './user-data.mjs';
-
-const PROBE_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'browser-probe.mjs');
 
 export const INSPECT_HINT = '地址栏打开 chrome://inspect/#remote-debugging（Edge 为 edge://inspect/#remote-debugging），' +
   '勾选 "Allow remote debugging for this browser instance"';
@@ -87,7 +85,8 @@ export function expandPath(raw) {
   return value;
 }
 
-// 配置值（数据目录路径或旧值）→ 浏览器 { id: 数据目录绝对路径, label: 显示名 }。无效值抛出可直接展示的错误。
+// 配置值（数据目录路径或旧值）→ 浏览器 { id: 数据目录绝对路径, label: 显示名 }。无效写法抛出可直接展示的错误。
+// 只做路径换算，不要求目录存在（比较升级前实例报告的旧值时也用它）；目录是否有效见 validateBrowser。
 export function resolveBrowser(raw) {
   const value = String(raw ?? '').trim();
   if (!value) throw new Error('浏览器配置为空');
@@ -96,8 +95,28 @@ export function resolveBrowser(raw) {
   if (!path.isAbsolute(expanded)) {
     throw new Error(`"${value}" 既不是浏览器数据目录的绝对路径，也不是旧配置值（chrome / chrome-canary / chromium / edge）`);
   }
-  const id = path.resolve(expanded);
+  let id = path.resolve(expanded);
+  try { id = fs.realpathSync.native(id); } catch { /* 目录不存在或无权限时保留字面规范化结果 */ }
   return { id, label: displayName(id) };
+}
+
+// 配置值必须指向真实的 Chromium 用户数据目录（含 Local State）。无效时抛出可直接展示的错误。
+// 无权限查看时无法判断，按有效处理，由读取端口文件时如实报告权限问题。
+export function validateBrowser(raw) {
+  const browser = resolveBrowser(raw);
+  const check = (file, test, message) => {
+    let stat;
+    try { stat = fs.statSync(file, { throwIfNoEntry: false }); }
+    catch (error) {
+      if (error.code === 'EPERM' || error.code === 'EACCES') return;
+      throw error;
+    }
+    if (!stat || !test(stat)) throw new Error(message);
+  };
+  check(browser.id, stat => stat.isDirectory(), `${browser.id} 不存在或不是文件夹`);
+  check(path.join(browser.id, 'Local State'), stat => stat.isFile(),
+    `${browser.id} 里没有 Local State，不是 Chromium 浏览器的用户数据目录`);
+  return browser;
 }
 
 // 显示名：从路径末尾跳过通用的 `User Data` 层，取第一个文件夹名（Dia/User Data → Dia，Google/Chrome → Chrome）
@@ -138,15 +157,13 @@ export function checkPort(port, host = '127.0.0.1', timeoutMs = 2000) {
 }
 
 // 读数据目录根部的 DevToolsActivePort（第 1 行端口，第 2 行 wsPath）。只读这一个文件。
-// 返回 { port, wsPath } 或 { reason, code? }，reason ∈ missing-dir | not-enabled | unreadable | invalid
+// 返回 { port, wsPath } 或 { reason, code? }，reason ∈ not-enabled | unreadable | invalid
 export function readActivePort(dataDir) {
   const file = path.join(dataDir, 'DevToolsActivePort');
   let content;
   try { content = fs.readFileSync(file, 'utf8'); }
   catch (error) {
-    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
-      return { reason: fs.existsSync(dataDir) ? 'not-enabled' : 'missing-dir' };
-    }
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return { reason: 'not-enabled' };
     return { reason: 'unreadable', code: error.code || 'EIO' };
   }
   const lines = content.trim().split(/\r?\n/).filter(Boolean);
@@ -185,6 +202,7 @@ export function getConfiguredBrowser() {
 //   kind ∈ 'ok' | 'unavailable' | 'unset' | 'config-error'
 //   ok          = 所选浏览器端口在监听；browser 含 { id, label, port, wsPath, endpointSource? }
 //   unavailable = 所选浏览器连不上（reason 同 readActivePort，另有 offline = 端口未监听），硬错
+//   config-error = 配置本身有误（值无效、目录不存在或不是 Chromium 数据目录、显式端口有误）
 //   unset       = 没有偏好也没有 override，需要首次配置
 //   source ∈ 'override' | 'preference'
 export async function selectBrowser(override = null) {
@@ -208,7 +226,7 @@ export async function selectBrowser(override = null) {
   if (!raw) return { kind: 'unset' };
   const source = override ? 'override' : 'preference';
   let browser;
-  try { browser = resolveBrowser(raw); }
+  try { browser = validateBrowser(raw); }
   catch (error) {
     return configError(`${override ? '--browser' : 'WEB_ACCESS_BROWSER'} 的值无效：${error.message}`);
   }
@@ -235,12 +253,6 @@ export function explainUnavailable(result) {
   const { browser, reason } = result;
   const config = userDataPaths().config;
   const who = `${result.source === 'override' ? '本次指定' : '默认偏好'}的浏览器 ${browser.label}（${browser.id}）`;
-  if (reason === 'missing-dir') {
-    return [
-      `${who} 的数据目录不存在`,
-      `请核对 WEB_ACCESS_BROWSER 或 --browser 的路径，可用 node "${PROBE_SCRIPT}" <文件夹> 重新确认；不会改用其他浏览器`,
-    ];
-  }
   if (reason === 'unreadable') {
     return [
       `无法读取 ${browser.label} 的调试端口文件（${result.code}）：${path.join(browser.id, 'DevToolsActivePort')}`,

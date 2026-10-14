@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { selectBrowser, getConfiguredBrowser, sameBrowser, browserLabel, explainUnavailable, INSPECT_HINT } from './browser-discovery.mjs';
+import { selectBrowser, getConfiguredBrowser, validateBrowser, sameBrowser, browserLabel, explainUnavailable, INSPECT_HINT } from './browser-discovery.mjs';
 import { appDataRoots, listTopFolders } from './browser-probe.mjs';
 import { userDataPaths, migrateLegacyData } from './user-data.mjs';
 
@@ -186,6 +186,20 @@ function printFirstRunGuide() {
   console.log('  仅本次使用（不写配置）：node check-deps.mjs --browser <数据目录路径>');
 }
 
+// --- 配置错误：与共享服务是否在运行无关，先于复用判断报告，不引导停止服务 ---
+
+function printConfigError(message, { browserValue = false } = {}) {
+  console.log(`browser: 配置错误 — ${message}`);
+  if (browserValue) {
+    console.log('  WEB_ACCESS_BROWSER / --browser 应为浏览器的用户数据目录，即含 Local State 的那一层' +
+      '（如 ~/Library/Application Support/Dia/User Data、%LOCALAPPDATA%\\Google\\Chrome\\User Data），不能只写文件夹名或相对路径');
+    console.log(`  不确定路径时用 node "${PROBE_SCRIPT}" <文件夹名> 确认，改正 ${CONFIG_PATH} 后重新运行`);
+  } else {
+    console.log(`  改正 ${CONFIG_PATH} 后重新运行`);
+  }
+  console.log('  这是配置问题，不需要停止或重启共享服务');
+}
+
 // --- 输出浏览器选择结果，返回是否可以继续启动 proxy ---
 
 async function resolveAndReport(override) {
@@ -193,7 +207,7 @@ async function resolveAndReport(override) {
 
   switch (result.kind) {
     case 'config-error': {
-      console.log(`browser: 配置错误 — ${result.message}`);
+      printConfigError(result.message);
       return { proceed: false, exitCode: 1 };
     }
     case 'ok': {
@@ -226,9 +240,18 @@ async function main() {
   ensureConfigExists();
   checkNode();
 
+  // 期望的浏览器值本身无效时先报配置错误，不进入「浏览器不一致 → 停止服务」的复用判断。
+  let browserId = opts.browser || getConfiguredBrowser();
+  if (browserId) {
+    try { validateBrowser(browserId); }
+    catch (error) {
+      printConfigError(`${opts.browser ? '--browser' : 'WEB_ACCESS_BROWSER'} 的值无效：${error.message}`, { browserValue: true });
+      process.exit(1);
+    }
+  }
+
   // 先复用服务，避免调试端口文件缺失或未设置偏好阻断现有连接。
   const health = await httpGetJson(HEALTH_URL);
-  let browserId = opts.browser || getConfiguredBrowser();
   if (health?.status !== 'ok') {
     const resolved = await resolveAndReport(opts.browser);
     if (!resolved.proceed) process.exit(resolved.exitCode);
