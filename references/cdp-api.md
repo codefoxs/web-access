@@ -94,21 +94,21 @@ curl -s -X POST "http://localhost:3456/eval?target=ID&frame=FRAME_ID" -d 'docume
 ```
 
 ### GET /frames?target=ID
-列出页面主文档里直接的 `<iframe>` / `<frame>`（不递归嵌套），按文档顺序返回数组：`index`、`frameId`（尚未加载为 `null`）、`url`（当前网址）、`crossProcess`（是否跨进程，即跨站 iframe），以及可选的定位线索 `id` / `name` / `src`（元素属性原值）。`frameId` 只含字母数字等网址安全字符，可直接放进 `/eval` 的查询参数。
+列出页面主文档里直接的 `<iframe>` / `<frame>`，按文档顺序返回数组。列举在隔离环境中进行，页面脚本改写 DOM API 不影响结果。
+
+| 字段 | 含义 |
+|---|---|
+| `index` | 在主文档 `document.querySelectorAll('iframe, frame')` 结果中的位置（从 0 开始），可用 `/eval` 按同一顺序对上具体元素 |
+| `frameId` | 用于 `/eval?frame=` 的标识；iframe 尚未加载出文档时为 `null`。只含字母数字等网址安全字符 |
+| `url` | iframe 当前的网址（导航后会与 `src` 不同） |
+| `crossProcess` | 是否在另一个进程（跨站 iframe）；父页面读不到这类 iframe 的 `contentDocument` |
+| `id` / `name` / `src` | 可选，iframe 元素的属性原值，用来认出是哪一个 |
+
+两步用法：先 `/frames` 按 `id`、`name`、`url` 或 `index` 认出目标 iframe，取它的 `frameId`，再 `/eval?target=ID&frame=FRAME_ID`。
+
+范围：不含 shadow root 里的 iframe，也不递归嵌套。嵌套在跨进程 iframe 里的 iframe，以外层 iframe 的 `frameId` 作 `target` 再调用一次（`/frames?target=FRAME_ID`、`/eval?target=FRAME_ID&frame=INNER_ID`）。
 ```bash
 curl -s "http://localhost:3456/frames?target=ID"
-```
-
-### POST /click?target=ID
-JS 层面点击（`el.click()`），POST body 为 CSS 选择器。自动 scrollIntoView 后点击。简单快速，覆盖大多数场景。
-```bash
-curl -s -X POST "http://localhost:3456/click?target=ID" -d 'button.submit'
-```
-
-### POST /clickAt?target=ID
-CDP 浏览器级真实鼠标点击（`Input.dispatchMouseEvent`），POST body 为 CSS 选择器。先获取元素坐标，再模拟鼠标按下/释放。算真实用户手势，能触发文件对话框、绕过部分反自动化检测。
-```bash
-curl -s -X POST "http://localhost:3456/clickAt?target=ID" -d 'button.upload'
 ```
 
 ### GET /clickXY?target=ID&x=120&y=90
