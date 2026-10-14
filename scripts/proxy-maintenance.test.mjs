@@ -415,7 +415,9 @@ test('收到停止确认但服务不退出时有界失败，不执行启动器',
   });
   const result = await f.run(proxy.port, ['restart']);
   assert.equal(result.code, 1, result.stderr);
-  assert.match(result.output.message, /15 秒内未退出/);
+  // 文案报告实际观察时长（测试加速了轮询间隔，远少于 15 秒），不再固定写「15 秒」
+  const seconds = Number(result.output.message.match(/在 ([\d.]+) 秒内未退出/)?.[1]);
+  assert.ok(seconds >= 0 && seconds < 15, result.output.message);
   assert.deepEqual(await f.events(), []);
 });
 
@@ -588,3 +590,49 @@ for (const action of ['stop', 'restart']) {
     assert.equal(starts.length, action === 'stop' ? 0 : 1);
   });
 }
+
+// 审查建议-7：/shutdown 被重置但服务并未接受停止（仍可读且未进入维护）时立即如实失败，不空等退出。
+for (const action of ['stop', 'restart']) {
+  test(`${action}：/shutdown 被重置而服务未进入维护时立即报告停止未生效，不启动、不强停`, async t => {
+    const f = await fixture(t);
+    let resets = 0;
+    const proxy = await fakeProxy(t, {
+      onRequest({ req }) {
+        if (req.url !== '/shutdown') return false;
+        resets++;
+        req.socket.destroy();
+        return true;
+      },
+    });
+    const result = await f.run(proxy.port, [action]);
+    assert.equal(result.code, 1, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.output.message, /停止未生效/);
+    assert.equal(result.output.health.instanceId, oldHealth.instanceId);
+    assert.equal(resets, 1);
+    assert.equal(proxy.requests.filter(request => request.path === '/health').length, 2);
+    assert.deepEqual(await f.events(), []);
+  });
+}
+
+test('退出观察期间连续多次连接重置不占观察次数，端口释放后报告 stopped', async t => {
+  const f = await fixture(t);
+  let accepted = false;
+  let resets = 0;
+  const proxy = await fakeProxy(t, {
+    onRequest({ req, server }) {
+      if (!accepted) return false;
+      req.socket.destroy();
+      if (++resets === 40) { server.close(); server.closeAllConnections(); }
+      return true;
+    },
+    shutdown({ res }) {
+      res.statusCode = 202;
+      res.end(JSON.stringify({ status: 'stopping', instanceId: oldHealth.instanceId }));
+      accepted = true;
+    },
+  });
+  const result = await f.run(proxy.port, ['stop']);
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(result.output.status, 'stopped');
+  assert.equal(resets, 40);
+});

@@ -76,9 +76,11 @@ function isBusy(health) {
 // 只有 ECONNREFUSED 证明旧实例已离开端口。退出过程中监听 socket 仍可能接入新连接再随进程重置，
 // 此时的 ECONNRESET（含 socket hang up）说明实例正在退出，继续观察而不是报错，也不据此判定已退出。
 async function waitForDeparture(port, instanceId) {
-  const deadline = Date.now() + STOP_TIMEOUT_MS;
-  // 次数同时有界，避免持续快速响应导致无界轮询。
-  for (let attempt = 0; attempt < 30 && Date.now() < deadline; attempt++) {
+  const started = Date.now();
+  const deadline = started + STOP_TIMEOUT_MS;
+  // 读到健康响应的次数同时有界，避免持续快速响应导致无界轮询；连接被重置只受总时限约束，不占这个次数。
+  let observations = 0;
+  while (observations < 30 && Date.now() < deadline) {
     let health;
     try { health = await readHealth(port, Math.max(1, Math.min(1000, deadline - Date.now()))); }
     catch (error) {
@@ -89,9 +91,21 @@ async function waitForDeparture(port, instanceId) {
     if (!health) return null;
     requireIdentity(health);
     if (health.instanceId !== instanceId) return health;
+    observations++;
     await new Promise(resolve => setTimeout(resolve, Math.min(500, Math.max(1, deadline - Date.now()))));
   }
-  throw new MaintenanceError('目标 Proxy 在 15 秒内未退出；没有强停或启动第二个实例', { instanceId });
+  const seconds = ((Date.now() - started) / 1000).toFixed(1);
+  throw new MaintenanceError(`目标 Proxy 在 ${seconds} 秒内未退出；没有强停或启动第二个实例`, { instanceId });
+}
+
+// /shutdown 的连接被重置后，区分「实例正在退出」与「停止请求根本没被接受」：
+// Proxy 在回 202 之前同步进入 maintenance 且不再退出该状态，所以同一实例仍可读且 maintenance 不为 true，
+// 就说明停止没有生效，应立即如实失败，而不是空等退出。读不到（拒绝、再次重置、已替换）交给退出观察处理。
+async function stopNotAccepted(port, instanceId) {
+  try {
+    const current = await readHealth(port);
+    return current?.instanceId === instanceId && current.maintenance !== true ? current : null;
+  } catch { return null; }
 }
 
 async function requestStop(port, health) {
@@ -108,6 +122,10 @@ async function requestStop(port, health) {
     // 另一维护者可能刚好停止了同一实例（端口已释放为 ECONNREFUSED，退出途中为 ECONNRESET），
     // 后续仍只观察旧身份；观察有界，不强停也不据此启动。
     if (error.code !== 'ECONNREFUSED' && error.code !== 'ECONNRESET') throw error;
+    const current = error.code === 'ECONNRESET' && await stopNotAccepted(port, health.instanceId);
+    if (current) {
+      throw new MaintenanceError('停止请求的连接被重置，服务仍在运行且没有进入维护，停止未生效；当前服务已保留，可稍后重试', { health: current });
+    }
     return waitForDeparture(port, health.instanceId);
   }
   if (result.code === 409) {
