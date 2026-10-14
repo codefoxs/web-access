@@ -62,13 +62,19 @@ async function readHealth(port, timeoutMs = 1000) {
   return result.body;
 }
 
-// 另一维护者正在停止实例时，连接可能在其退出瞬间被重置（含 connect ECONNRESET）。
+// 连接被正在退出的进程中断：读到重置（ECONNRESET，含 socket hang up）或写入时对端已关（EPIPE）。
+// 两者都只说明实例可能正在退出，不能据此判定已退出或未退出。
+function isBrokenConnection(error) {
+  return error.code === 'ECONNRESET' || error.code === 'EPIPE';
+}
+
+// 另一维护者正在停止实例时，连接可能在其退出瞬间被中断（含 connect ECONNRESET）。
 // 短暂重试到得到明确结果：健康响应、拒绝连接（null）或其他错误；重置本身不作为结论。
 async function readHealthSettled(port) {
   for (let attempt = 0; ; attempt++) {
     try { return await readHealth(port); }
     catch (error) {
-      if (error.code !== 'ECONNRESET' || attempt >= 20) throw error;
+      if (!isBrokenConnection(error) || attempt >= 20) throw error;
       await new Promise(resolve => setTimeout(resolve, 100));
     }
   }
@@ -96,7 +102,7 @@ async function waitForDeparture(port, instanceId) {
     let health;
     try { health = await readHealth(port, Math.max(1, Math.min(1000, deadline - Date.now()))); }
     catch (error) {
-      if (error.code !== 'ECONNRESET') throw error;
+      if (!isBrokenConnection(error)) throw error;
       await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))));
       continue;
     }
@@ -131,10 +137,10 @@ async function requestStop(port, health) {
       method: 'POST', body: { instanceId: health.instanceId },
     });
   } catch (error) {
-    // 另一维护者可能刚好停止了同一实例（端口已释放为 ECONNREFUSED，退出途中为 ECONNRESET），
+    // 另一维护者可能刚好停止了同一实例（端口已释放为 ECONNREFUSED，退出途中为 ECONNRESET / EPIPE），
     // 后续仍只观察旧身份；观察有界，不强停也不据此启动。
-    if (error.code !== 'ECONNREFUSED' && error.code !== 'ECONNRESET') throw error;
-    const current = error.code === 'ECONNRESET' && await stopNotAccepted(port, health.instanceId);
+    if (error.code !== 'ECONNREFUSED' && !isBrokenConnection(error)) throw error;
+    const current = isBrokenConnection(error) && await stopNotAccepted(port, health.instanceId);
     if (current) {
       throw new MaintenanceError('停止请求的连接被重置，服务仍在运行且没有进入维护，停止未生效；当前服务已保留，可稍后重试', { health: current });
     }

@@ -83,6 +83,19 @@ process.exit(1);
   await fs.writeFile(preload, `
 const original = globalThis.setTimeout;
 globalThis.setTimeout = (callback, delay, ...args) => original(callback, delay >= 1000 ? delay : Math.min(delay, 40), ...args);
+// TEST_EPIPE_HEALTH=n：第 n 次 /health 请求在写出时以 EPIPE 失败（模拟对端进程正在退出）
+if (process.env.TEST_EPIPE_HEALTH) {
+  const http = (await import('node:http')).default;
+  const originalRequest = http.request;
+  let healthCount = 0;
+  http.request = (options, ...rest) => {
+    const req = originalRequest(options, ...rest);
+    if (options.path === '/health' && ++healthCount === Number(process.env.TEST_EPIPE_HEALTH)) {
+      req.once('socket', () => req.destroy(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })));
+    }
+    return req;
+  };
+}
 `);
   const events = async () => {
     try { return (await fs.readFile(eventsPath, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line)); }
@@ -99,10 +112,10 @@ globalThis.setTimeout = (callback, delay, ...args) => original(callback, delay >
   });
   return {
     events,
-    async run(port, args = [], startMode = 'connected') {
+    async run(port, args = [], startMode = 'connected', extraEnv = {}) {
       const child = spawn(process.execPath, ['--import', preload, path.join(scripts, 'proxy-maintenance.mjs'), ...args], {
         env: {
-          ...process.env, CDP_PROXY_PORT: String(port), TEST_EVENTS_PATH: eventsPath, TEST_START_MODE: startMode,
+          ...process.env, ...extraEnv, CDP_PROXY_PORT: String(port), TEST_EVENTS_PATH: eventsPath, TEST_START_MODE: startMode,
           HOME: root, USERPROFILE: root, LOCALAPPDATA: path.join(root, 'AppData', 'Local'),
         },
         stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
@@ -656,3 +669,12 @@ for (const action of ['status', 'stop']) {
     assert.equal(result.output.status, action === 'status' ? 'running' : 'stopped');
   });
 }
+
+// 冒烟中出现过的 write EPIPE：退出观察时写请求，对端进程已关闭连接。与 ECONNRESET 一样继续观察，而不是报错。
+test('stop：退出观察期间请求以 EPIPE 失败时继续观察，确认退出后报告 stopped', async t => {
+  const f = await fixture(t);
+  const proxy = await fakeProxy(t);
+  const result = await f.run(proxy.port, ['stop'], 'connected', { TEST_EPIPE_HEALTH: '2' });
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(result.output.status, 'stopped');
+});
