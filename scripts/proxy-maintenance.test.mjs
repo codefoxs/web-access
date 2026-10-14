@@ -636,3 +636,23 @@ test('退出观察期间连续多次连接重置不占观察次数，端口释�
   assert.equal(result.output.status, 'stopped');
   assert.equal(resets, 40);
 });
+
+// 审查建议-9：另一维护者正在停止实例时，入口读取的连接可能被重置；短暂重试到得到明确结果，而不是报错退出。
+for (const action of ['status', 'stop']) {
+  test(`${action}：入口健康检查的连接被短暂重置时重试，不报 ECONNRESET`, async t => {
+    const f = await fixture(t);
+    let resets = 0;
+    const proxy = await fakeProxy(t, {
+      onRequest({ req }) {
+        if (req.url !== '/health' || resets >= 2) return false;
+        resets++;
+        req.socket.destroy();
+        return true;
+      },
+    });
+    const result = await f.run(proxy.port, [action]);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.equal(resets, 2);
+    assert.equal(result.output.status, action === 'status' ? 'running' : 'stopped');
+  });
+}

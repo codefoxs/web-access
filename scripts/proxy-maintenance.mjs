@@ -62,6 +62,18 @@ async function readHealth(port, timeoutMs = 1000) {
   return result.body;
 }
 
+// 另一维护者正在停止实例时，连接可能在其退出瞬间被重置（含 connect ECONNRESET）。
+// 短暂重试到得到明确结果：健康响应、拒绝连接（null）或其他错误；重置本身不作为结论。
+async function readHealthSettled(port) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await readHealth(port); }
+    catch (error) {
+      if (error.code !== 'ECONNRESET' || attempt >= 20) throw error;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+}
+
 function requireIdentity(health) {
   if (typeof health.instanceId !== 'string' || !health.instanceId) {
     throw new MaintenanceError('旧服务没有 instanceId，无法安全维护；需要一次性迁移，禁止自动强停', { health }, 2);
@@ -129,7 +141,7 @@ async function requestStop(port, health) {
     return waitForDeparture(port, health.instanceId);
   }
   if (result.code === 409) {
-    const current = await readHealth(port);
+    const current = await readHealthSettled(port);
     if (!current) return null;
     requireIdentity(current);
     if (current.instanceId !== health.instanceId) return current;
@@ -197,7 +209,7 @@ async function main() {
   if (!/^\d+$/.test(rawPort) || port < 1 || port > 65535) {
     throw new MaintenanceError('CDP_PROXY_PORT 必须是 1 到 65535 的整数', {}, 2);
   }
-  const health = await readHealth(port);
+  const health = await readHealthSettled(port);
   if (action === 'status') {
     console.log(JSON.stringify(health ? { status: 'running', health } : { status: 'stopped' }));
     return;
@@ -214,7 +226,7 @@ async function main() {
     result = restartedResult(replacement, health, true);
   } else {
     const startup = await runCheckDeps(port, health?.browser?.id);
-    result = restartedResult(await readHealth(port), health, false, startup);
+    result = restartedResult(await readHealthSettled(port), health, false, startup);
   }
   console.log(JSON.stringify(result));
   if (result.status === 'waitingAuthorization') process.exitCode = 3;
