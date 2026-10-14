@@ -2,19 +2,20 @@
 // 首次配置的浏览器探测 - 单一职责模块
 // 被 check-deps.mjs 共享（未设置浏览器时列出应用数据根目录的最外层文件夹名），也是给 Agent 的探测命令：
 //   node browser-probe.mjs <文件夹> [更多文件夹]
-// 文件夹可以是应用数据根目录下的文件夹名（如 Dia、Google、BraveSoftware），
-// 也可以是绝对路径（支持 ~，Windows 另支持 %LOCALAPPDATA% / %APPDATA%）。
+// 文件夹是应用数据根目录下的相对路径：通常是一个文件夹名（如 Dia、Google、BraveSoftware），
+// 也可以多级（如 Windows 的 Packages\TheBrowserCompany.Arc_ttt1ap7aakyb4）。
 //
-// 边界（不读取浏览器数据内容）：
+// 边界（由代码保证，不靠 Agent 自觉；不读取浏览器数据内容）：
 //   - 列根目录只 readdir 根目录本身，不进入任何子文件夹
-//   - 探测只在 Agent 指定的文件夹内向下最多 MAX_DEPTH 层，以 `Local State` 文件识别 Chromium 用户数据目录，识别后不再深入
+//   - 探测范围限定在应用数据根目录之内：拒绝 ~、..越界、根目录本身、根目录之外的绝对路径，以及经软链接指向根目录之外的文件夹
+//   - 只在指定文件夹内向下最多 MAX_DEPTH 层，以 `Local State` 文件识别 Chromium 用户数据目录，识别后不再深入；无权限的目录跳过并注明
 //   - 对识别出的数据目录只看 `Local State` 是否存在、读 DevToolsActivePort 的端口，并只做 TCP 探测（不建 WebSocket，不触发授权）
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { checkPort, displayName, expandPath, readActivePort, INSPECT_HINT } from './browser-discovery.mjs';
+import { checkPort, displayName, readActivePort, INSPECT_HINT } from './browser-discovery.mjs';
 
 const MAX_DEPTH = 3;
 const MAX_DIRS = 500; // 防止误指向巨大目录时无界遍历
@@ -43,11 +44,46 @@ export function listTopFolders(root) {
   }
 }
 
-// 文件夹参数 → 待探测的绝对路径（文件夹名在各应用数据根目录下查找）
+// target 是否严格位于 base 之内（不等于 base 本身）
+function isInside(base, target) {
+  const rel = path.relative(base, target);
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+function realpathOrSelf(dir) {
+  try { return fs.realpathSync.native(dir); }
+  catch { return dir; }
+}
+
+// 文件夹参数 → 待探测的绝对路径（可能在多个根目录下各有一个）。越界参数抛出可直接展示的错误；
+// 根目录下不存在时返回空数组。
 export function resolveFolder(arg) {
-  const expanded = expandPath(arg);
-  if (path.isAbsolute(expanded)) return [path.resolve(expanded)];
-  return appDataRoots().map(root => path.join(root, expanded)).filter(dir => fs.existsSync(dir));
+  const value = String(arg ?? '').trim();
+  const roots = appDataRoots();
+  const hint = `只能写应用数据根目录（${roots.join('、') || '当前平台未知'}）下的文件夹，如 Dia、Google`;
+  if (!value) throw new Error(`文件夹参数为空；${hint}`);
+  if (value.startsWith('~')) throw new Error(`不接受 ~ 路径；${hint}`);
+  let candidates;
+  if (path.isAbsolute(value)) {
+    const target = path.resolve(value);
+    candidates = roots.filter(root => isInside(root, target)).map(root => ({ root, target }));
+    if (!candidates.length) throw new Error(`${target} 不在应用数据根目录之内，已拒绝；${hint}`);
+  } else {
+    candidates = roots.map(root => ({ root, target: path.resolve(root, value) }));
+    if (!candidates.every(({ root, target }) => isInside(root, target))) {
+      throw new Error(`"${value}" 指向应用数据根目录本身或其外部，已拒绝；${hint}`);
+    }
+  }
+  const folders = [];
+  for (const { root, target } of candidates) {
+    if (!fs.existsSync(target)) continue;
+    // 软链接可能把根目录内的名字指到外部（如 ~/Documents），按真实路径再确认一次
+    if (!isInside(realpathOrSelf(root), realpathOrSelf(target))) {
+      throw new Error(`${target} 经软链接指向应用数据根目录之外，已拒绝`);
+    }
+    folders.push(target);
+  }
+  return folders;
 }
 
 // 只判断 `Local State` 是否存在；无权限（EACCES / EPERM）时抛出，由调用方把该目录记为跳过
@@ -133,7 +169,7 @@ async function main() {
   const args = process.argv.slice(2);
   if (!args.length || args.includes('--help')) {
     console.log('用法：node browser-probe.mjs <文件夹> [更多文件夹]');
-    console.log(`  文件夹为应用数据根目录（${appDataRoots().join('、') || '当前平台未知'}）下的文件夹名，或绝对路径`);
+    console.log(`  文件夹为应用数据根目录（${appDataRoots().join('、') || '当前平台未知'}）下的相对路径，通常就是文件夹名`);
     process.exitCode = args.length ? 0 : 2;
     return;
   }
@@ -142,7 +178,7 @@ async function main() {
     let folders;
     try { folders = resolveFolder(arg); }
     catch (error) {
-      console.log(`probe: ${arg}\n  ${error.message}`);
+      console.log(`probe: ${arg}\n  参数无效 — ${error.message}`);
       continue;
     }
     if (!folders.length) {

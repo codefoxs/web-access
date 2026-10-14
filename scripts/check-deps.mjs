@@ -179,7 +179,7 @@ function printFirstRunGuide() {
   }
   console.log('  Agent 下一步：');
   console.log('    1. 从文件夹名认出 Chromium 内核浏览器（如 Google、Microsoft Edge、BraveSoftware、Arc、Dia、Vivaldi、com.operasoftware.Opera）');
-  console.log(`    2. 只探测认出的文件夹：node "${PROBE_SCRIPT}" <文件夹名> [更多文件夹名]`);
+  console.log(`    2. 只探测认出的文件夹：node "${PROBE_SCRIPT}" <文件夹名> [更多文件夹名]（只接受上面根目录下的相对路径）`);
   console.log('    3. 把探测到的浏览器和远程调试状态告诉用户，询问用哪个（即使只找到一个也要问）');
   console.log(`    4. 把用户选定的数据目录写入 ${CONFIG_PATH}：WEB_ACCESS_BROWSER=<数据目录路径>`);
   console.log(`    5. 远程调试未开启时，请用户在该浏览器的${INSPECT_HINT}，再重新运行本检查`);

@@ -85,6 +85,7 @@ async function fixture(t, { platform = 'darwin' } = {}) {
       assert.equal(outcome.code, 0, `${outcome.stdout}\n${outcome.stderr}`);
       return { ...outcome, result: JSON.parse(outcome.stdout.trim()) };
     },
+    exec,
     cli: (...args) => exec([path.join(scripts, 'browser-probe.mjs'), ...args]),
     // 建浏览器数据目录：Local State + 可选 DevToolsActivePort + 一个 profile 子目录（探测不应进入）
     async browser(base, relative, portFile = null) {
@@ -195,21 +196,56 @@ test('探测深度有界：第 3 层能找到，第 4 层不再深入', async t 
   assert.ok(!readdirs.some(dir => dir.endsWith(path.join('c', 'd', 'e'))), readdirs.join('\n'));
 });
 
-test('文件夹参数：名字在应用数据根目录下查找，绝对路径与 ~ 原样使用，数据目录本身也可直接探测', async t => {
+test('文件夹参数：在应用数据根目录下查找，支持多级相对路径与根目录内的绝对路径', async t => {
   const f = await fixture(t);
   const dia = await f.browser(f.appRoot, 'Dia/User Data');
   assert.deepEqual((await f.call('resolve', { folder: 'Dia' })).result, [path.join(f.appRoot, 'Dia')]);
+  assert.deepEqual((await f.call('resolve', { folder: 'Dia/User Data/' })).result, [dia]);
   assert.deepEqual((await f.call('resolve', { folder: 'NotInstalled' })).result, []);
-  assert.deepEqual((await f.call('resolve', { folder: '~/Library/Application Support/Dia/' })).result, [path.join(f.appRoot, 'Dia')]);
+  assert.deepEqual((await f.call('resolve', { folder: path.join(f.appRoot, 'Dia') })).result, [path.join(f.appRoot, 'Dia')]);
   const { result } = await f.call('probe', { folder: dia });
   assert.deepEqual(result.browsers.map(browser => browser.dataDir), [dia]);
 });
 
-test('Windows 文件夹名同时在 LOCALAPPDATA 与 APPDATA 下查找（Opera 位于 Roaming）', async t => {
+test('探测范围由代码限定：拒绝 ~、.. 越界、根目录本身、根目录外的绝对路径与软链接逃逸，且不列举任何目录', async t => {
+  const f = await fixture(t);
+  await f.browser(path.join(f.home, 'Documents'), 'proj/fakebrowser');
+  await fs.symlink(path.join(f.home, 'Documents'), path.join(f.appRoot, 'LinkOut'));
+  const cases = [
+    ['~', /不接受 ~/],
+    ['~/Documents', /不接受 ~/],
+    ['..', /根目录本身或其外部/],
+    ['../..', /根目录本身或其外部/],
+    ['Dia/../../..', /根目录本身或其外部/],
+    ['.', /根目录本身或其外部/],
+    ['', /参数为空/],
+    [path.join(f.home, 'Documents'), /不在应用数据根目录之内/],
+    [f.appRoot, /不在应用数据根目录之内/],
+    ['LinkOut', /软链接指向应用数据根目录之外/],
+  ];
+  for (const [folder, pattern] of cases) {
+    const outcome = await f.exec([path.join(f.root, 'runner.mjs')], { action: 'resolve', folder });
+    assert.notEqual(outcome.code, 0, folder);
+    assert.match(outcome.stderr, pattern, folder);
+    assert.deepEqual(outcome.readdirs, [], folder);
+  }
+  const cli = await f.cli('..', '~', 'LinkOut');
+  assert.equal(cli.code, 1, cli.stdout + cli.stderr);
+  assert.equal((cli.stdout.match(/参数无效/g) || []).length, 3, cli.stdout);
+  assert.doesNotMatch(cli.stdout, /fakebrowser/);
+  assert.deepEqual(cli.readdirs, []);
+});
+
+test('Windows 文件夹名同时在 LOCALAPPDATA 与 APPDATA 下查找（Opera 位于 Roaming），多级路径从该处起限深', async t => {
   const f = await fixture(t, { platform: 'win32' });
   await fs.mkdir(path.join(f.appData, 'Opera Software'), { recursive: true });
   const { result } = await f.call('resolve', { folder: 'Opera Software' });
   assert.deepEqual(result, [path.join(f.appData, 'Opera Software')]);
+  const arcPackage = path.join(f.localAppData, 'Packages', 'TheBrowserCompany.Arc_ttt1ap7aakyb4');
+  const arc = await f.browser(arcPackage, 'LocalCache/Local/Arc/User Data');
+  const cli = await f.cli(path.join('Packages', 'TheBrowserCompany.Arc_ttt1ap7aakyb4', 'LocalCache'));
+  assert.equal(cli.code, 0, cli.stdout + cli.stderr);
+  assert.ok(cli.stdout.includes(`- Arc：${arc}`), cli.stdout);
 });
 
 test('命令行输出数据目录、调试状态与可直接写入的配置行，退出码区分是否找到', async t => {
