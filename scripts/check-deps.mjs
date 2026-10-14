@@ -38,19 +38,22 @@ function parseArgs(argv) {
   return opts;
 }
 
-// --- 旧版本用户数据一次性迁移：失败不阻塞，旧文件仍在原处，下次重试 ---
+// --- 旧版本用户数据一次性迁移：失败不阻塞，旧文件仍在原处，下次重试。返回是否已完成（含此前已完成） ---
 
 function migrateUserData() {
   try {
     const result = migrateLegacyData();
-    if (!result?.sources.length) return;
-    const parts = result.sources.map(({ from, config, patterns }) => {
-      const items = [config && 'config.env', patterns && `${patterns} 个站点经验文件`].filter(Boolean).join('、');
-      return `${items}（来自 ${from}）`;
-    });
-    console.log(`user-data: 已迁移 ${parts.join('；')} → ${result.dir}（旧文件保留未删）`);
+    if (result?.sources.length) {
+      const parts = result.sources.map(({ from, config, patterns }) => {
+        const items = [config && 'config.env', patterns && `${patterns} 个站点经验文件`].filter(Boolean).join('、');
+        return `${items}（来自 ${from}）`;
+      });
+      console.log(`user-data: 已迁移 ${parts.join('；')} → ${result.dir}（旧文件保留未删）`);
+    }
+    return true;
   } catch (error) {
     console.log(`user-data: warn — 旧数据迁移到 ${USER_DATA.dir} 失败（${error.message}），旧文件仍在原处，下次运行重试`);
+    return false;
   }
 }
 
@@ -236,8 +239,8 @@ async function resolveAndReport(override) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  migrateUserData(); // 先迁移，避免模板创建的空 config.env 挡住旧偏好
-  ensureConfigExists();
+  // 先迁移，再从模板建配置：迁移失败时不建，否则下次重试时空模板会挡住旧偏好（复制不覆盖已有文件）
+  if (migrateUserData()) ensureConfigExists();
   checkNode();
 
   // 期望的浏览器值本身无效时先报配置错误，不进入「浏览器不一致 → 停止服务」的复用判断。

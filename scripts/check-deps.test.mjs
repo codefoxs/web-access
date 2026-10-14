@@ -490,3 +490,26 @@ test('经软链接写的数据目录与运行实例报告的真实路径视为�
   success(await f.run(proxy.port));
   assert.deepEqual(await f.events(), []);
 });
+
+// 审查应修-4：迁移失败的那次运行若从模板创建了空 config.env，下次重试时旧偏好会被 COPYFILE_EXCL 跳过而悄悄丢失。
+test('迁移失败的运行不创建模板配置，下次重试仍能迁入旧偏好', { skip: (process.platform === 'win32' || process.getuid?.() === 0) && '需要非 root 的 POSIX' }, async t => {
+  const f = await fixture(t);
+  await fs.rm(path.dirname(f.configPath), { recursive: true });
+  await fs.copyFile(path.join(SCRIPTS, '..', 'templates', 'config.env.template'), path.join(f.skill, 'templates', 'config.env.template'));
+  await fs.writeFile(path.join(f.skill, 'config.env'), 'WEB_ACCESS_BROWSER=chrome\n');
+  const locked = path.join(f.skill, 'references', 'site-patterns', 'archive');
+  await fs.mkdir(locked, { recursive: true });
+  await fs.chmod(locked, 0o000);
+  const proxy = await fakeProxy(t, { browser: 'chrome' });
+  let first;
+  try { first = await f.run(proxy.port); }
+  finally { await fs.chmod(locked, 0o755); }
+  assert.equal(first.stdout.split('\n').filter(line => line.startsWith('user-data: warn')).length, 1, first.stdout);
+  assert.doesNotMatch(first.stdout, /已从模板创建/);
+  assert.equal(await fs.access(f.configPath).then(() => true, () => false), false);
+
+  const second = await f.run(proxy.port);
+  success(second);
+  assert.match(second.stdout, /^user-data: 已迁移 config\.env/m);
+  assert.equal(await fs.readFile(f.configPath, 'utf8'), 'WEB_ACCESS_BROWSER=chrome\n');
+});
