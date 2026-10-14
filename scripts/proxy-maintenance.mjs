@@ -17,11 +17,13 @@ class MaintenanceError extends Error {
   }
 }
 
+// 每个维护请求独占一条连接（agent: false）：Node 19+ 默认 keep-alive，
+// 若 /shutdown 用过的连接被放回池中，退出观察的 /health 会复用它，在 Proxy process.exit 时收到 ECONNRESET。
 function requestJson(port, pathname, { method = 'GET', body, timeoutMs = 1000 } = {}) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : JSON.stringify(body);
     const req = http.request({
-      hostname: '127.0.0.1', port, path: pathname, method,
+      hostname: '127.0.0.1', port, path: pathname, method, agent: false,
       headers: payload === null ? {} : {
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(payload),
@@ -71,11 +73,19 @@ function isBusy(health) {
     || ['discovering', 'connecting'].includes(health.connectionState);
 }
 
+// 只有 ECONNREFUSED 证明旧实例已离开端口。退出过程中监听 socket 仍可能接入新连接再随进程重置，
+// 此时的 ECONNRESET（含 socket hang up）说明实例正在退出，继续观察而不是报错，也不据此判定已退出。
 async function waitForDeparture(port, instanceId) {
   const deadline = Date.now() + STOP_TIMEOUT_MS;
   // 次数同时有界，避免持续快速响应导致无界轮询。
   for (let attempt = 0; attempt < 30 && Date.now() < deadline; attempt++) {
-    const health = await readHealth(port, Math.max(1, Math.min(1000, deadline - Date.now())));
+    let health;
+    try { health = await readHealth(port, Math.max(1, Math.min(1000, deadline - Date.now()))); }
+    catch (error) {
+      if (error.code !== 'ECONNRESET') throw error;
+      await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))));
+      continue;
+    }
     if (!health) return null;
     requireIdentity(health);
     if (health.instanceId !== instanceId) return health;

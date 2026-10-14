@@ -122,15 +122,18 @@ globalThis.setTimeout = (callback, delay, ...args) => original(callback, Math.mi
   };
 }
 
-async function fakeProxy(t, { health = oldHealth, shutdown, healthResponse, statusCode = 200 } = {}) {
+async function fakeProxy(t, { health = oldHealth, shutdown, healthResponse, statusCode = 200, onRequest } = {}) {
   const requests = [];
+  const sockets = new Map(); // socket -> 连接序号，用于断言维护请求是否复用连接
   let current = { ...health };
   const server = http.createServer((req, res) => {
+    if (onRequest?.({ req, res, server, requests })) return;
+    if (!sockets.has(req.socket)) sockets.set(req.socket, sockets.size);
     (async () => {
       let text = '';
       for await (const chunk of req) text += chunk;
       const body = text ? JSON.parse(text) : null;
-      requests.push({ method: req.method, path: req.url, body, origin: req.headers.origin });
+      requests.push({ method: req.method, path: req.url, body, origin: req.headers.origin, connection: sockets.get(req.socket) });
       res.setHeader('content-type', 'application/json');
       if (req.url === '/health') {
         res.statusCode = statusCode;
@@ -476,6 +479,60 @@ test('参数与端口校验发生在任何 HTTP 或启动动作之前', async t 
   assert.deepEqual(proxy.requests, []);
   assert.deepEqual(await f.events(), []);
 });
+
+// 真实 Proxy 在 202 之后立即 process.exit：若客户端复用 keep-alive 连接或把退出期间的连接重置当作失败，
+// stop 会报 ECONNRESET、restart 停掉旧服务却不拉起新服务（审计 5.1）。以下两例用确定的时序复现这两种情况。
+test('维护请求不复用连接：/shutdown 之后的健康检查走新连接', async t => {
+  const f = await fixture(t);
+  const proxy = await fakeProxy(t, {
+    shutdown({ res, server }) {
+      res.statusCode = 202;
+      res.end(JSON.stringify({ status: 'stopping', instanceId: oldHealth.instanceId }));
+      // 模拟进程退出：之后不再响应，已有连接全部断开
+      res.once('finish', () => { server.close(); server.closeAllConnections(); });
+    },
+  });
+  const result = await f.run(proxy.port, ['stop']);
+  assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(result.output.status, 'stopped');
+  const connections = proxy.requests.map(request => request.connection);
+  assert.equal(new Set(connections).size, connections.length, JSON.stringify(proxy.requests));
+});
+
+for (const action of ['stop', 'restart']) {
+  test(`${action}：退出期间新连接被重置（ECONNRESET）时继续观察，确认退出后${action === 'restart' ? '拉起新服务并保留原浏览器' : '报告 stopped'}`, async t => {
+    const f = await fixture(t);
+    let accepted = false;
+    let resets = 0;
+    const proxy = await fakeProxy(t, {
+      health: { ...oldHealth, browser: { id: 'edge', label: 'Microsoft Edge' } },
+      onRequest({ req, server }) {
+        if (!accepted) return false;
+        // 退出中的进程：监听 socket 仍接入连接，随后重置；第 3 次之后端口释放
+        req.socket.destroy();
+        if (++resets === 3) { server.close(); server.closeAllConnections(); }
+        return true;
+      },
+      shutdown({ res }) {
+        res.statusCode = 202;
+        res.end(JSON.stringify({ status: 'stopping', instanceId: oldHealth.instanceId }));
+        accepted = true;
+      },
+    });
+    const result = await f.run(proxy.port, [action]);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.equal(resets, 3);
+    if (action === 'stop') {
+      assert.equal(result.output.status, 'stopped');
+      assert.deepEqual(await f.events(), []);
+      return;
+    }
+    assert.equal(result.output.status, 'ready');
+    assert.equal(result.output.reused, false);
+    assert.equal(result.output.health.instanceId, 'new-instance');
+    assert.deepEqual((await f.events()).filter(event => event.action === 'startup'), [{ action: 'startup', args: ['--browser', 'edge'] }]);
+  });
+}
 
 test('restart 升级前实例报告旧值、新实例报告标准路径时视为同一浏览器', async t => {
   const f = await fixture(t);
