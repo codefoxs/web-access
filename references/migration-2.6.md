@@ -69,7 +69,7 @@ WEB_ACCESS_BROWSER=chrome
 `WEB_ACCESS_BROWSER` 为空、且没有可复用的共享服务时，前置检查以 `exit 2` 结束，并输出应用数据根目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`，以及 snap 的 `~/snap`、flatpak 的 `~/.var/app`）的最外层文件夹名，不进入任何文件夹。Agent 接着：
 
 1. 从文件夹名认出 Chromium 内核浏览器
-2. 只探测认出的文件夹：`node "<skill路径>/scripts/browser-probe.mjs" <文件夹名> [更多文件夹名]`（只接受应用数据根目录下的相对路径）
+2. 只探测认出的文件夹：`node "<skill路径>/scripts/browser-probe.mjs" <文件夹名> [更多文件夹名]`（只接受应用数据根目录下的相对路径；snap 浏览器写 `<名>/current/.config` 这类经 `current` 的路径，`current` 是根目录内的软链接，允许）
 3. 告诉用户找到了哪些、远程调试是否已开启，问用户用哪个（即使只有一个也要问），把选定的数据目录写进 `~/.web-access/config.env`
 4. 未开启的，请用户在该浏览器地址栏打开 `chrome://inspect/#remote-debugging`（Edge 为 `edge://inspect/#remote-debugging`）勾选 "Allow remote debugging for this browser instance"
 

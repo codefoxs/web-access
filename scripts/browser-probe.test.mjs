@@ -334,3 +334,28 @@ test('Linux：snap 与 flatpak 的浏览器可按文件夹名探测，首次配�
   await fs.rm(path.join(f.home, '.var'), { recursive: true });
   assert.deepEqual((await f.call('listRoots')).result, [{ root: f.appRoot, folders: ['BraveSoftware'] }]);
 });
+
+// 审查 F7：snap 的 ~/snap/<名>/current 是指向同根目录内修订目录的软链接，应当允许；只有指出根目录才拒绝。
+// 经 current 探测时，输出的数据目录保留 current 写法，snap 升级换修订号后配置仍然有效。
+test('Linux snap：经同根目录内的 current 软链接探测被允许，输出保留 current 路径；指出根目录的软链接仍被拒绝', async t => {
+  const f = await fixture(t, { platform: 'linux' });
+  const snap = path.join(f.home, 'snap');
+  await f.browser(snap, 'brave/123/.config/BraveSoftware/Brave-Browser');
+  await fs.symlink('123', path.join(snap, 'brave', 'current'));
+  await fs.mkdir(path.join(f.home, 'Documents'), { recursive: true });
+  await fs.symlink(path.join(f.home, 'Documents'), path.join(snap, 'evil'));
+
+  const viaCurrent = await f.cli('brave/current/.config');
+  assert.equal(viaCurrent.code, 0, viaCurrent.stdout + viaCurrent.stderr);
+  const expected = path.join(snap, 'brave', 'current', '.config', 'BraveSoftware', 'Brave-Browser');
+  assert.ok(viaCurrent.stdout.includes(`WEB_ACCESS_BROWSER=${expected}`), viaCurrent.stdout);
+
+  // 从应用文件夹本身探测：数据目录在第 4 层（<修订号>/.config/BraveSoftware/Brave-Browser），超出深度上限，且不经过 current 软链接
+  const fromApp = await f.cli('brave');
+  assert.equal(fromApp.code, 1, fromApp.stdout);
+  assert.match(fromApp.stdout, /未找到 Chromium 浏览器数据目录/);
+
+  const escaped = await f.cli('evil');
+  assert.equal(escaped.code, 1);
+  assert.match(escaped.stdout, /软链接指向应用数据根目录之外/);
+});

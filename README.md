@@ -183,7 +183,7 @@ WEB_ACCESS_BROWSER=~/Library/Application Support/Dia/User Data
 # 旧值 chrome / chrome-canary / chromium / edge 仍可用，按平台对应到标准目录
 ```
 
-一般不用手填：留空、且没有可复用的共享服务时，Agent 运行前置检查会进入首次配置——列出应用数据目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`，以及 snap 的 `~/snap`、flatpak 的 `~/.var/app`）里的文件夹名，从中认出浏览器，用 `scripts/browser-probe.mjs` 只在认出的文件夹里确认数据目录和远程调试状态（探测范围由脚本限定在应用数据目录内），问你用哪个后写入。日常运行只读所配置目录里的端口文件；连不上就报错并给出处理步骤，不会换到别的浏览器，也不会扫描固定端口。
+一般不用手填：留空、且没有可复用的共享服务时，Agent 运行前置检查会进入首次配置——列出应用数据目录（macOS `~/Library/Application Support`、Windows `%LOCALAPPDATA%` 与 `%APPDATA%`、Linux `~/.config`，以及 snap 的 `~/snap`、flatpak 的 `~/.var/app`）里的文件夹名（snap 浏览器的数据目录在带修订号的子目录里，探测时写 `brave/current/.config` 这类经 `current` 的相对路径，配置随 snap 升级仍有效），从中认出浏览器，用 `scripts/browser-probe.mjs` 只在认出的文件夹里确认数据目录和远程调试状态（探测范围由脚本限定在应用数据目录内），问你用哪个后写入。日常运行只读所配置目录里的端口文件；连不上就报错并给出处理步骤，不会换到别的浏览器，也不会扫描固定端口。
 
 如果系统拒绝读取 `DevToolsActivePort`，可在同一配置中设置可选的 `WEB_ACCESS_CDP_PORT`。它必须与 `WEB_ACCESS_BROWSER` 配对，填入已核对属于该浏览器的端口；留空使用自动发现。TCP 可达只表示端口在监听，浏览器归属由这份明确配置提供。指定其他浏览器时不会借用此端口，端口失效也不自动降级。
 
