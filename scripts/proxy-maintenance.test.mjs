@@ -77,10 +77,12 @@ for (let i = 0; i < 100; i++) {
 }
 process.exit(1);
 `);
+  // 只压缩轮询间隔（< 1s），不压缩单个请求的总时限（1s）：
+  // 后者被压到 40ms 时，机器负载高会让超时抢在 ECONNREFUSED 之前触发，把「没有服务」误报成「请求超时」。
   const preload = path.join(root, 'fast-timers.mjs');
   await fs.writeFile(preload, `
 const original = globalThis.setTimeout;
-globalThis.setTimeout = (callback, delay, ...args) => original(callback, Math.min(delay, 40), ...args);
+globalThis.setTimeout = (callback, delay, ...args) => original(callback, delay >= 1000 ? delay : Math.min(delay, 40), ...args);
 `);
   const events = async () => {
     try { return (await fs.readFile(eventsPath, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line)); }
