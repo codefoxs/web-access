@@ -1,4 +1,4 @@
-"""Merge upstream history and reapply the fork's description without running upstream code."""
+"""Merge upstream and regenerate the fork's description and README without running upstream code."""
 
 import argparse
 from pathlib import Path
@@ -39,6 +39,9 @@ def main():
     parser.add_argument("--patch-only", action="store_true")
     parser.add_argument("--upstream", default="refs/remotes/upstream/main")
     args = parser.parse_args()
+    # Read the original README from upstream Git, never from the generated working file.
+    # Resolve before merging so missing/renamed upstream documentation fails early.
+    upstream_readme = git("show", args.upstream + ":README.md", capture=True)
     if not args.patch_only:
         if git("status", "--porcelain", capture=True).strip():
             raise RuntimeError("Working tree must be clean before synchronization")
@@ -47,6 +50,7 @@ def main():
             ".github/workflows/sync_upstream.yml",
             ".github/custom_sync/sync.py",
             ".github/custom_sync/test_sync.py",
+            ".github/custom_sync/readme_intro.md",
             "FORK_SYNC.md",
         ]
         saved = {path: git("show", "HEAD:" + path, capture=True) for path in protected}
@@ -61,7 +65,12 @@ def main():
     skill.write_bytes(updated.encode("utf-8"))
     if patch_description(updated) != updated:
         raise RuntimeError("Description patch is not idempotent")
-    print("Custom description applied; other SKILL.md content preserved.")
+    intro = Path(".github/custom_sync/readme_intro.md").read_bytes().decode("utf-8").rstrip()
+    if not intro:
+        raise ValueError("README introduction is empty; refusing to regenerate")
+    prefix = (intro + "\n\n---\n\n## 以下为上游原文\n\n").encode("utf-8")
+    Path("README.md").write_bytes(prefix + upstream_readme)
+    print("Custom description applied; README regenerated with unmodified upstream text.")
 
 
 if __name__ == "__main__":
